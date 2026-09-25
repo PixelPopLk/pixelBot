@@ -1,12 +1,13 @@
 /**
  * PixelPop Telegram File Store Bot (Cloudflare Worker)
+ * Production Ready - Full Version
  */
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Cross-Origin Headers
+    // Cross-Origin Headers (Website එකට Access දීම සඳහා)
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -17,7 +18,7 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 🔍 1. TEST ENDPOINT (ලෙඩේ හොයන කොටස)
+    // 🔍 1. SYSTEM TEST ENDPOINT
     if (url.pathname === "/test") {
       const channelCheck = await callTelegram(env.BOT_TOKEN, "getChat", {
         chat_id: env.STORAGE_CHANNEL_ID,
@@ -45,7 +46,7 @@ export default {
       );
     }
 
-    // 2. Website එකෙන් Verify Signal එක එන Endpoint එක
+    // 2. WEBSITE VERIFY ENDPOINT (Ad එක බැලූ පසු Files යවන තැන)
     if (url.pathname === "/verify") {
       const userId = url.searchParams.get("a");
       if (!userId) {
@@ -59,10 +60,10 @@ export default {
         userData.verified = true;
         let tgResults = [];
 
-        // Auto Delivery: User ආපසු Telegram එකට එද්දී Files යවා තිබීම
+        // Auto Delivery: User ආපසු Telegram එකට එන විට Files යවා තිබීම
         if (!userData.delivered) {
           userData.delivered = true;
-          tgResults = await sendBatchFiles(env, userId, userData.startMsg, userData.endMsg);
+          tgResults = await sendBatchFiles(env, userId, userData.msgIds);
         }
 
         await env.BOT_KV.put(userKey, JSON.stringify(userData), { expirationTtl: 3600 });
@@ -77,7 +78,7 @@ export default {
       return new Response("Pending session not found", { status: 404, headers: corsHeaders });
     }
 
-    // 3. Telegram Webhook Updates
+    // 3. TELEGRAM WEBHOOK (පණිවිඩ කළමනාකරණය)
     if (request.method === "POST") {
       try {
         const update = await request.json();
@@ -99,29 +100,63 @@ async function handleTelegramUpdate(update, env) {
     const chatId = msg.chat.id.toString();
     const text = msg.text || "";
 
-    // 1. Admin Features (Files Forward කර /done ගැසීම)
+    // 1. ADMIN ONLY ACTIONS
     if (chatId === env.ADMIN_ID.toString()) {
-      if (msg.document || msg.video || msg.audio || msg.photo) {
-        const res = await callTelegram(env.BOT_TOKEN, "copyMessage", {
-          chat_id: env.STORAGE_CHANNEL_ID,
-          from_chat_id: chatId,
-          message_id: msg.message_id,
-        });
+      // A. Files Forward / Upload කළ විට Handle කිරීම
+      if (!text.startsWith("/")) {
+        let channelMsgId = null;
 
-        if (res.ok) {
-          const channelMsgId = res.result.message_id;
+        // පරීක්ෂා කිරීම: File එක දැනටමත් Storage Channel එකෙන් Forward කරපු එකක්ද?
+        const originChatId =
+          msg.forward_origin?.chat?.id?.toString() ||
+          msg.forward_from_chat?.id?.toString();
+        const originMsgId =
+          msg.forward_origin?.message_id ||
+          msg.forward_from_message_id;
+
+        const storageChannelId = env.STORAGE_CHANNEL_ID.toString();
+
+        if (originChatId && originChatId === storageChannelId && originMsgId) {
+          // දැනටමත් Channel එකේ තියෙන එකක් නම්: නැවත Copy නොකර කෙලින්ම Message ID එක ගනී!
+          channelMsgId = originMsgId;
           let batch = (await env.BOT_KV.get("admin_batch", { type: "json" })) || [];
           batch.push(channelMsgId);
           await env.BOT_KV.put("admin_batch", JSON.stringify(batch), { expirationTtl: 86400 });
 
           await callTelegram(env.BOT_TOKEN, "sendMessage", {
             chat_id: chatId,
-            text: `📥 File received! (Saved as ID: ${channelMsgId})\nතව Files එවන්න හෝ අවසන් වූ පසු /done යවන්න.`,
+            text: `✅ Storage Channel එකේ File එකක් අඳුනාගත්තා! (Message ID: ${channelMsgId})\nතව Files එවන්න හෝ අවසන් වූ පසු /done යවන්න.`,
           });
+          return;
+        } else {
+          // වෙනත් තැනකින් ආ එකක් නම්: Storage Channel එකට Auto-Copy කරයි!
+          const res = await callTelegram(env.BOT_TOKEN, "copyMessage", {
+            chat_id: env.STORAGE_CHANNEL_ID,
+            from_chat_id: chatId,
+            message_id: msg.message_id,
+          });
+
+          if (res.ok) {
+            channelMsgId = res.result.message_id;
+            let batch = (await env.BOT_KV.get("admin_batch", { type: "json" })) || [];
+            batch.push(channelMsgId);
+            await env.BOT_KV.put("admin_batch", JSON.stringify(batch), { expirationTtl: 86400 });
+
+            await callTelegram(env.BOT_TOKEN, "sendMessage", {
+              chat_id: chatId,
+              text: `📥 File එක Channel එකට Copy කරන ලදී! (Saved as ID: ${channelMsgId})\nතව Files එවන්න හෝ අවසන් වූ පසු /done යවන්න.`,
+            });
+          } else {
+            await callTelegram(env.BOT_TOKEN, "sendMessage", {
+              chat_id: chatId,
+              text: `❌ File එක Channel එකට දාන්න බැරි උනා!\nහේතුව: ${res.description || "Unknown error"}`,
+            });
+          }
+          return;
         }
-        return;
       }
 
+      // B. Admin /done එබූ විට Link එක සකස් කිරීම
       if (text === "/done") {
         const batch = await env.BOT_KV.get("admin_batch", { type: "json" });
 
@@ -133,50 +168,72 @@ async function handleTelegramUpdate(update, env) {
           return;
         }
 
-        const startId = Math.min(...batch);
-        const endId = Math.max(...batch);
-        const secretCode = btoa(`get-${startId}-${endId}`);
+        // Unique IDs පමණක් ගෙන පිළිවෙලට සකස් කිරීම
+        const uniqueIds = [...new Set(batch)].sort((a, b) => a - b);
+        const startId = uniqueIds[0];
+        const endId = uniqueIds[uniqueIds.length - 1];
+
+        let payloadString = "";
+        // IDs එක ළඟ පිළිවෙලට තිබේ නම් (Continuous Range)
+        if (uniqueIds.length === endId - startId + 1) {
+          payloadString = `get-${startId}-${endId}`;
+        } else {
+          // විසිරුණු Message IDs නම්
+          payloadString = `list-${uniqueIds.join(",")}`;
+        }
+
+        const secretCode = btoa(payloadString);
         const finalLink = `https://t.me/${env.BOT_USERNAME}?start=${secretCode}`;
 
         await callTelegram(env.BOT_TOKEN, "sendMessage", {
           chat_id: chatId,
           parse_mode: "Markdown",
-          text: `✅ *Batch Link Created Successfully!*\n\n📁 *Files Count:* ${batch.length}\n🔢 *Range:* ${startId} to ${endId}\n\n🔗 *Your Link:*\n\`${finalLink}\`\n\n_(Link එක උඩ Click කර Copy කරගන්න)_`,
+          text: `✅ *Batch Link Created Successfully!*\n\n📁 *Total Files:* ${uniqueIds.length}\n🔢 *Message IDs:* ${uniqueIds.join(", ")}\n\n🔗 *Your Link:*\n\`${finalLink}\`\n\n_(Link එක මත Click කර Copy කරගන්න)_`,
         });
 
+        // Batch Queue එක ඉවත් කිරීම
         await env.BOT_KV.delete("admin_batch");
         return;
       }
 
+      // C. Queue එක Cancel කිරීමට /cancel
       if (text === "/cancel") {
         await env.BOT_KV.delete("admin_batch");
         await callTelegram(env.BOT_TOKEN, "sendMessage", {
           chat_id: chatId,
-          text: "🗑️ Batch එක ඉවත් කරන ලදී.",
+          text: "🗑️ Batch එක සාර්ථකව ඉවත් කරන ලදී.",
         });
         return;
       }
     }
 
-    // 2. User /start Command
+    // 2. USER /start DEEP LINK HANDLER
     if (text.startsWith("/start")) {
       const parts = text.split(" ");
 
       if (parts.length > 1) {
         try {
-          const rawCode = atob(parts[1]);
-          const match = rawCode.match(/^get-(\d+)-(\d+)$/);
+          const rawCode = atob(parts[1]); // Decode Base64
+          let targetMsgIds = [];
 
-          if (!match) throw new Error("Invalid format");
+          if (rawCode.startsWith("get-")) {
+            const match = rawCode.match(/^get-(\d+)-(\d+)$/);
+            if (!match) throw new Error("Invalid range");
+            const start = parseInt(match[1]);
+            const end = parseInt(match[2]);
+            for (let i = start; i <= end; i++) targetMsgIds.push(i);
+          } else if (rawCode.startsWith("list-")) {
+            const listStr = rawCode.replace("list-", "");
+            targetMsgIds = listStr.split(",").map((id) => parseInt(id));
+          } else {
+            throw new Error("Unknown format");
+          }
 
-          const startMsg = parseInt(match[1]);
-          const endMsg = parseInt(match[2]);
-
+          // User Session එක KV එකේ Save කිරීම
           await env.BOT_KV.put(
             `user_${chatId}`,
             JSON.stringify({
-              startMsg,
-              endMsg,
+              msgIds: targetMsgIds,
               timestamp: Date.now(),
               verified: false,
               delivered: false,
@@ -215,7 +272,7 @@ async function handleTelegramUpdate(update, env) {
     }
   }
 
-  // B. "I have clicked ads" Callback
+  // B. "I have clicked ads" CALLBACK HANDLER (Manual Fallback)
   if (update.callback_query) {
     const cb = update.callback_query;
     const chatId = cb.from.id.toString();
@@ -252,7 +309,7 @@ async function handleTelegramUpdate(update, env) {
           show_alert: false,
         });
 
-        await sendBatchFiles(env, chatId, data.startMsg, data.endMsg);
+        await sendBatchFiles(env, chatId, data.msgIds);
       } else {
         await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
           callback_query_id: cb.id,
@@ -265,9 +322,9 @@ async function handleTelegramUpdate(update, env) {
 }
 
 // Storage Channel එකෙන් Files ටික User ට යැවීම
-async function sendBatchFiles(env, chatId, startMsg, endMsg) {
+async function sendBatchFiles(env, chatId, msgIds) {
   let results = [];
-  for (let msgId = startMsg; msgId <= endMsg; msgId++) {
+  for (const msgId of msgIds) {
     const res = await callTelegram(env.BOT_TOKEN, "copyMessage", {
       chat_id: chatId,
       from_chat_id: env.STORAGE_CHANNEL_ID,
@@ -278,7 +335,7 @@ async function sendBatchFiles(env, chatId, startMsg, endMsg) {
   return results;
 }
 
-// Telegram API Call Helper
+// Telegram API Helper
 async function callTelegram(token, method, body) {
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
