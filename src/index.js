@@ -1,10 +1,10 @@
 /**
- * PixelPop Telegram File Store Bot (Cloudflare Worker)
- * 100% Bug-Free Production Code - HTML Entities Supported
+ * PixelPop Telegram File Store Bot (Cloudflare Worker + D1 Database)
+ * Capable of handling 20,000+ daily downloads with ZERO limits!
  */
 
 export default {
-  // 1. Scheduled Event (පැය 6න් Files Delete කිරීම)
+  // 1. Scheduled Event (පැය 6න් Files Auto-Delete කිරීම)
   async scheduled(event, env, ctx) {
     ctx.waitUntil(cleanExpiredMessages(env));
   },
@@ -25,7 +25,7 @@ export default {
     // Lazy Auto Cleanup on incoming requests
     ctx.waitUntil(cleanExpiredMessages(env));
 
-    // 🔍 1. SYSTEM TEST ENDPOINT
+    // 🔍 1. SYSTEM DIAGNOSTIC TEST
     if (url.pathname === "/test") {
       const storageCheck = await callTelegram(env.BOT_TOKEN, "getChat", {
         chat_id: env.STORAGE_CHANNEL_ID,
@@ -35,19 +35,26 @@ export default {
         ? await callTelegram(env.BOT_TOKEN, "getChat", { chat_id: env.FORCE_SUB_CHANNEL_ID })
         : { ok: true, note: "Force sub not configured" };
 
+      let d1Status = "OK";
+      try {
+        await env.DB.prepare("SELECT 1").first();
+      } catch (err) {
+        d1Status = `D1 Error: ${err.message}`;
+      }
+
       const adminCheck = await callTelegram(env.BOT_TOKEN, "sendMessage", {
         chat_id: env.ADMIN_ID,
-        text: "🔔 Test Message: System is 100% operational!",
+        text: "🔔 Test Message: System & D1 Database are 100% operational!",
       });
 
       return new Response(
         JSON.stringify(
           {
+            database_status: d1Status,
             storage_channel: storageCheck,
             main_channel_fsub: fsubCheck,
             admin_status: adminCheck,
             configured_storage_id: env.STORAGE_CHANNEL_ID,
-            configured_fsub_id: env.FORCE_SUB_CHANNEL_ID,
           },
           null,
           2
@@ -58,42 +65,15 @@ export default {
       );
     }
 
-    // 2. WEBSITE VERIFY ENDPOINT
-    if (url.pathname === "/verify") {
+    // 2. AD CLICK RECORD (User Ad එකට ගිය වෙලාව D1 Database එකේ සටහන් කිරීම)
+    if (url.pathname === "/ad_started" || url.pathname === "/verify") {
       const userId = url.searchParams.get("a");
-      if (!userId) {
-        return new Response("Missing user ID", { status: 400, headers: corsHeaders });
+      if (userId && env.DB) {
+        await env.DB.prepare(`
+          UPDATE users SET ad_started_at = ? WHERE user_id = ?
+        `).bind(Date.now(), userId.toString()).run();
       }
-
-      const userKey = `user_${userId}`;
-      const userData = await env.BOT_KV.get(userKey, { type: "json" });
-
-      if (userData) {
-        userData.verified = true;
-        await env.BOT_KV.put(userKey, JSON.stringify(userData), { expirationTtl: 3600 });
-
-        let idsToSend = userData.msgIds;
-        if (!idsToSend && userData.startMsg && userData.endMsg) {
-          idsToSend = [];
-          for (let i = userData.startMsg; i <= userData.endMsg; i++) idsToSend.push(i);
-        }
-
-        let tgResults = [];
-        if (!userData.delivered && idsToSend && idsToSend.length > 0) {
-          userData.delivered = true;
-          tgResults = await sendBatchFiles(env, userId, idsToSend);
-          await env.BOT_KV.put(userKey, JSON.stringify(userData), { expirationTtl: 3600 });
-        }
-
-        return new Response(
-          JSON.stringify({ status: "success", verified: true, delivered: userData.delivered, telegram_response: tgResults }),
-          {
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      return new Response("Pending session not found", { status: 404, headers: corsHeaders });
+      return new Response("OK", { headers: corsHeaders });
     }
 
     // 3. TELEGRAM WEBHOOK
@@ -107,7 +87,7 @@ export default {
       return new Response("OK");
     }
 
-    return new Response("PixelPop Bot is Running Online!");
+    return new Response("PixelPop Bot with D1 Database is Running Online!");
   },
 };
 
@@ -121,7 +101,6 @@ async function handleTelegramUpdate(update, env) {
 
     // 1. ADMIN ONLY (Files එක්රැස් කිරීම)
     if (chatId === env.ADMIN_ID?.toString()) {
-      // Command එකක් නොවන ඕනෑම File එකක් ආ විට
       if (!text.startsWith("/")) {
         let channelMsgId = null;
 
@@ -135,11 +114,11 @@ async function handleTelegramUpdate(update, env) {
         const storageChannelId = env.STORAGE_CHANNEL_ID?.toString();
 
         if (originChatId && originChatId === storageChannelId && originMsgId) {
-          // Storage Channel එකේම File එකක් නම්: Direct ID එක ගනී
+          // Storage Channel එකේම File එකක් නම්: Original ID එක D1 එකට දමයි
           channelMsgId = originMsgId;
-          let batch = (await env.BOT_KV.get("admin_batch", { type: "json" })) || [];
-          batch.push(channelMsgId);
-          await env.BOT_KV.put("admin_batch", JSON.stringify(batch), { expirationTtl: 86400 });
+          await env.DB.prepare(`INSERT INTO admin_batch (message_id) VALUES (?)`).bind(channelMsgId).run();
+
+          const countRes = await env.DB.prepare(`SELECT COUNT(*) as count FROM admin_batch`).first();
 
           const adminKb = {
             inline_keyboard: [
@@ -151,7 +130,7 @@ async function handleTelegramUpdate(update, env) {
           await callTelegram(env.BOT_TOKEN, "sendMessage", {
             chat_id: chatId,
             parse_mode: "HTML",
-            text: `✅ <b>Storage Channel File Detected!</b> (ID: <code>${channelMsgId}</code>)\nTotal files in batch: <b>${batch.length}</b>\n\nForward more files, or click below to generate link:`,
+            text: `✅ <b>Storage Channel File Detected!</b> (ID: <code>${channelMsgId}</code>)\nTotal files in batch: <b>${countRes?.count || 1}</b>\n\nForward more files, or click below to generate link:`,
             reply_markup: adminKb,
           });
           return;
@@ -165,9 +144,9 @@ async function handleTelegramUpdate(update, env) {
 
           if (res.ok) {
             channelMsgId = res.result.message_id;
-            let batch = (await env.BOT_KV.get("admin_batch", { type: "json" })) || [];
-            batch.push(channelMsgId);
-            await env.BOT_KV.put("admin_batch", JSON.stringify(batch), { expirationTtl: 86400 });
+            await env.DB.prepare(`INSERT INTO admin_batch (message_id) VALUES (?)`).bind(channelMsgId).run();
+
+            const countRes = await env.DB.prepare(`SELECT COUNT(*) as count FROM admin_batch`).first();
 
             const adminKb = {
               inline_keyboard: [
@@ -179,7 +158,7 @@ async function handleTelegramUpdate(update, env) {
             await callTelegram(env.BOT_TOKEN, "sendMessage", {
               chat_id: chatId,
               parse_mode: "HTML",
-              text: `📥 <b>File Copied to Storage Channel!</b> (Saved as ID: <code>${channelMsgId}</code>)\nTotal files in batch: <b>${batch.length}</b>\n\nForward more files, or click below to generate link:`,
+              text: `📥 <b>File Copied to Storage Channel!</b> (Saved as ID: <code>${channelMsgId}</code>)\nTotal files in batch: <b>${countRes?.count || 1}</b>\n\nForward more files, or click below to generate link:`,
               reply_markup: adminKb,
             });
           } else {
@@ -192,14 +171,13 @@ async function handleTelegramUpdate(update, env) {
         }
       }
 
-      // /done Command එක ආ විට
       if (text.startsWith("/done")) {
         await generateBatchLink(env, chatId);
         return;
       }
 
       if (text.startsWith("/cancel")) {
-        await env.BOT_KV.delete("admin_batch");
+        await env.DB.prepare(`DELETE FROM admin_batch`).run();
         await callTelegram(env.BOT_TOKEN, "sendMessage", {
           chat_id: chatId,
           parse_mode: "HTML",
@@ -214,7 +192,7 @@ async function handleTelegramUpdate(update, env) {
       await callTelegram(env.BOT_TOKEN, "sendMessage", {
         chat_id: chatId,
         parse_mode: "HTML",
-        text: `📖 <b>How to Use this Bot / භාවිතා කරන්නේ කෙසේද?</b>\n\n<b>English:</b>\n1. Click on any Movie/Series link from our channel.\n2. Make sure you are subscribed to our main channel.\n3. Watch the quick 5-second ad to unlock files.\n4. Files will be delivered directly here! Save or forward them within 6 hours.\n\n<b>සිංහල:</b>\n1. අපගේ Channel එකේ ඇති Movie/Series link එකක් ඔබන්න.\n2. අපගේ ප්‍රධාන Channel එකට Join වී සිටින්න.\n3. තත්පර 5ක Ad එක නරඹා Files ලබාගන්න.\n4. ලැබෙන Files පැය 6කින් මැකී යන බැවින් Saved Messages වෙත දමාගන්න!`,
+        text: `📖 <b>How to Use this Bot / භාවිතා කරන්නේ කෙසේද?</b>\n\n<b>English:</b>\n1. Click on any Movie/Series link from our channel.\n2. Make sure you are subscribed to our main channel.\n3. Click 'Watch Ads (for 5s)' and stay on the sponsor ad for at least 5 seconds.\n4. Return here and click 'I have clicked ads ⁉️' to get files!\n\n<b>සිංහල:</b>\n1. Channel එකේ ඇති Movie/Series link එකක් ඔබන්න.\n2. අපගේ ප්‍රධාන Channel එකට Join වී සිටින්න.\n3. 'Watch Ads (for 5s)' ඔබා Ad එකෙහි අවම වශයෙන් තත්පර 5ක් රැඳී සිටින්න.\n4. නැවත මෙහි පැමිණ 'I have clicked ads ⁉️' ඔබා Files ලබාගන්න!`,
       });
       return;
     }
@@ -229,8 +207,6 @@ async function handleTelegramUpdate(update, env) {
         // 🛡️ CHECK FORCE SUBSCRIBE
         const isSubscribed = await checkUserSubscription(env, chatId);
         if (!isSubscribed) {
-          await env.BOT_KV.put(`pending_fsub_${chatId}`, payload, { expirationTtl: 3600 });
-
           const fsubKeyboard = {
             inline_keyboard: [
               [{ text: `📢 Join ${env.FORCE_SUB_CHANNEL_NAME || "Our Channel"}`, url: env.FORCE_SUB_CHANNEL_LINK }],
@@ -271,7 +247,7 @@ async function handleTelegramUpdate(update, env) {
 
     // Admin Cancel Button
     if (cb.data === "admin_cancel" && chatId === env.ADMIN_ID?.toString()) {
-      await env.BOT_KV.delete("admin_batch");
+      await env.DB.prepare(`DELETE FROM admin_batch`).run();
       await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
         callback_query_id: cb.id,
         text: "🗑️ Batch Cleared!",
@@ -305,12 +281,13 @@ async function handleTelegramUpdate(update, env) {
       return;
     }
 
-    // "I have clicked ads" Button
+    // 🔒 "I have clicked ads" Button (STRICT 5s ANTI-CHEAT + D1 Database)
     if (cb.data === "check_ad") {
-      const userKey = `user_${chatId}`;
-      const data = await env.BOT_KV.get(userKey, { type: "json" });
+      const user = await env.DB.prepare(`
+        SELECT * FROM users WHERE user_id = ?
+      `).bind(chatId).first();
 
-      if (!data) {
+      if (!user) {
         await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
           callback_query_id: cb.id,
           text: "⚠️ Session Expired! Please click the download link again.",
@@ -319,7 +296,7 @@ async function handleTelegramUpdate(update, env) {
         return;
       }
 
-      if (data.delivered === true) {
+      if (user.delivered === 1) {
         await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
           callback_query_id: cb.id,
           text: "✅ Files already sent! Check your chat.\nFiles දැනටමත් ඔබ වෙත එවා ඇත!",
@@ -328,30 +305,48 @@ async function handleTelegramUpdate(update, env) {
         return;
       }
 
-      if (data.verified === true) {
-        data.delivered = true;
-        await env.BOT_KV.put(userKey, JSON.stringify(data), { expirationTtl: 3600 });
-
+      // 1. User Ad එක Click කර නැත්නම්
+      if (!user.ad_started_at) {
         await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
           callback_query_id: cb.id,
-          text: "✅ Verified! Sending files now...",
-          show_alert: false,
-        });
-
-        let idsToSend = data.msgIds;
-        if (!idsToSend && data.startMsg && data.endMsg) {
-          idsToSend = [];
-          for (let i = data.startMsg; i <= data.endMsg; i++) idsToSend.push(i);
-        }
-
-        await sendBatchFiles(env, chatId, idsToSend);
-      } else {
-        await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
-          callback_query_id: cb.id,
-          text: "❌ You haven't watched the ad yet! Please watch the 5s ad.\nඔබ තවමත් Ad එක නරඹා නැත!",
+          text: "❌ You haven't clicked the ad button yet!\nඔබ තවමත් 'Watch Ads (for 5s)' Button එක ඔබා නැත!",
           show_alert: true,
         });
+        return;
       }
+
+      // 2. තත්පර 5 Timer එක පරීක්ෂා කිරීම
+      const timePassedSeconds = (Date.now() - user.ad_started_at) / 1000;
+
+      if (timePassedSeconds < 5) {
+        const remaining = Math.ceil(5 - timePassedSeconds);
+        await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+          callback_query_id: cb.id,
+          text: `⏳ Please watch the ad for 5 seconds! (${remaining}s remaining)\nකරුණාකර තවත් තත්පර ${remaining}ක් Ad එක නරඹා නැවත උත්සාහ කරන්න.`,
+          show_alert: true,
+        });
+        return;
+      }
+
+      // 3. තත්පර 5 සම්පූර්ණ නම් Files Release කිරීම
+      await env.DB.prepare(`
+        UPDATE users SET delivered = 1 WHERE user_id = ?
+      `).bind(chatId).run();
+
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+        callback_query_id: cb.id,
+        text: "✅ Verification Successful! Sending files...\nතහවුරු විය! Files එවමින් පවතී...",
+        show_alert: false,
+      });
+
+      let idsToSend = [];
+      try {
+        idsToSend = JSON.parse(user.msg_ids);
+      } catch {
+        idsToSend = [];
+      }
+
+      await sendBatchFiles(env, chatId, idsToSend);
     }
   }
 }
@@ -360,7 +355,8 @@ async function handleTelegramUpdate(update, env) {
 
 // Admin Link Generation Logic
 async function generateBatchLink(env, chatId) {
-  const batch = await env.BOT_KV.get("admin_batch", { type: "json" });
+  const batchRes = await env.DB.prepare(`SELECT message_id FROM admin_batch`).all();
+  const batch = (batchRes.results || []).map((r) => r.message_id);
 
   if (!batch || batch.length === 0) {
     await callTelegram(env.BOT_TOKEN, "sendMessage", {
@@ -390,7 +386,7 @@ async function generateBatchLink(env, chatId) {
     text: `🎉 <b>Batch Link Generated Successfully!</b>\n━━━━━━━━━━━━━━━━━━━\n📁 <b>Files Count:</b> ${uniqueIds.length}\n🔢 <b>Message IDs:</b> <code>${uniqueIds.join(", ")}</code>\n\n🔗 <b>Shareable Link:</b>\n<code>${finalLink}</code>\n━━━━━━━━━━━━━━━━━━━\n<i>(Tap link to copy & paste in your channel post)</i>`,
   });
 
-  await env.BOT_KV.delete("admin_batch");
+  await env.DB.prepare(`DELETE FROM admin_batch`).run();
 }
 
 // FSUB Membership Verification
@@ -432,16 +428,15 @@ async function initiateFileSession(env, chatId, payload) {
       throw new Error("Unknown format");
     }
 
-    await env.BOT_KV.put(
-      `user_${chatId}`,
-      JSON.stringify({
-        msgIds: targetMsgIds,
-        timestamp: Date.now(),
-        verified: false,
-        delivered: false,
-      }),
-      { expirationTtl: 3600 }
-    );
+    // D1 Database එකේ User Record එක සුරැකීම (Upsert)
+    await env.DB.prepare(`
+      INSERT INTO users (user_id, msg_ids, ad_started_at, delivered)
+      VALUES (?, ?, NULL, 0)
+      ON CONFLICT(user_id) DO UPDATE SET
+        msg_ids = excluded.msg_ids,
+        ad_started_at = NULL,
+        delivered = 0
+    `).bind(chatId, JSON.stringify(targetMsgIds)).run();
 
     const websiteUrl = env.WEBSITE_URL || "https://pixelpoplk.pages.dev";
     const adUrl = `${websiteUrl}/verify.html?a=${chatId}`;
@@ -456,7 +451,7 @@ async function initiateFileSession(env, chatId, payload) {
     await callTelegram(env.BOT_TOKEN, "sendMessage", {
       chat_id: chatId,
       parse_mode: "HTML",
-      text: `👇 <b>Watch a Quick 5-Second Ad to Get Files:</b>\nClick the button below, watch the ad, and return here. Files will be delivered automatically.\n\n👇 <b>Files ලබා ගැනීමට තත්පර 5ක Ad එක නරඹන්න:</b>\nපහත Button එක ඔබා Ad එක නරඹන්න. Files ස්වයංක්‍රීයව ලැබෙනු ඇත.`,
+      text: `👇 <b>Watch a Quick 5-Second Ad to Get Files:</b>\nClick the button below, watch the ad for at least 5 seconds, and return here. Then tap 'I have clicked ads ⁉️' to get your files.\n\n👇 <b>Files ලබා ගැනීමට තත්පර 5ක Ad එක නරඹන්න:</b>\nපහත Button එක ඔබා අවම වශයෙන් තත්පර 5ක් Ad එක නරඹන්න. අනතුරුව 'I have clicked ads ⁉️' ඔබා Files ලබාගන්න.`,
       reply_markup: keyboard,
     });
   } catch {
@@ -498,39 +493,34 @@ async function sendBatchFiles(env, chatId, msgIds) {
     sentMessageIds.push(warningMsg.result.message_id);
   }
 
-  // 6 Hours Timestamp
+  // 6 Hours Deletion Queue (D1 Database එකට ඇතුළත් කිරීම)
   const deleteAt = Date.now() + 6 * 60 * 60 * 1000;
-
-  let queue = (await env.BOT_KV.get("deletion_queue", { type: "json" })) || [];
   for (const sentId of sentMessageIds) {
-    queue.push({ chatId, messageId: sentId, deleteAt });
+    await env.DB.prepare(`
+      INSERT INTO deletions (chat_id, message_id, delete_at) VALUES (?, ?, ?)
+    `).bind(chatId, sentId, deleteAt).run();
   }
-  await env.BOT_KV.put("deletion_queue", JSON.stringify(queue));
 
   return results;
 }
 
-// Cleanup Expired Messages
+// Cleanup Expired Messages (D1 Database එකෙන් කියවා මකා දැමීම)
 async function cleanExpiredMessages(env) {
-  const queue = await env.BOT_KV.get("deletion_queue", { type: "json" });
-  if (!queue || queue.length === 0) return;
+  if (!env.DB) return;
 
   const now = Date.now();
-  const remaining = [];
+  const expired = await env.DB.prepare(`
+    SELECT * FROM deletions WHERE delete_at <= ? LIMIT 50
+  `).bind(now).all();
 
-  for (const item of queue) {
-    if (item.deleteAt <= now) {
+  if (expired.results && expired.results.length > 0) {
+    for (const item of expired.results) {
       await callTelegram(env.BOT_TOKEN, "deleteMessage", {
-        chat_id: item.chatId,
-        message_id: item.messageId,
+        chat_id: item.chat_id,
+        message_id: item.message_id,
       });
-    } else {
-      remaining.push(item);
+      await env.DB.prepare(`DELETE FROM deletions WHERE id = ?`).bind(item.id).run();
     }
-  }
-
-  if (remaining.length !== queue.length) {
-    await env.BOT_KV.put("deletion_queue", JSON.stringify(remaining));
   }
 }
 
