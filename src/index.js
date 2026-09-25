@@ -1,13 +1,12 @@
 /**
  * PixelPop Telegram File Store Bot (Cloudflare Worker)
- * All credentials are read securely from Environment Variables (env)
  */
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Cross-Origin Headers (Website එකට access දීම සඳහා)
+    // Cross-Origin Headers
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -18,7 +17,35 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 1. Website එකෙන් Verify Signal එක එන Endpoint එක
+    // 🔍 1. TEST ENDPOINT (ලෙඩේ හොයන කොටස)
+    if (url.pathname === "/test") {
+      const channelCheck = await callTelegram(env.BOT_TOKEN, "getChat", {
+        chat_id: env.STORAGE_CHANNEL_ID,
+      });
+
+      const adminCheck = await callTelegram(env.BOT_TOKEN, "sendMessage", {
+        chat_id: env.ADMIN_ID,
+        text: "🔔 Test Message: Bot ට ඔයාට Messages එවන්න පුළුවන්!",
+      });
+
+      return new Response(
+        JSON.stringify(
+          {
+            channel_status: channelCheck,
+            admin_status: adminCheck,
+            configured_channel_id: env.STORAGE_CHANNEL_ID,
+            configured_admin_id: env.ADMIN_ID,
+          },
+          null,
+          2
+        ),
+        {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    // 2. Website එකෙන් Verify Signal එක එන Endpoint එක
     if (url.pathname === "/verify") {
       const userId = url.searchParams.get("a");
       if (!userId) {
@@ -30,23 +57,27 @@ export default {
 
       if (userData) {
         userData.verified = true;
+        let tgResults = [];
 
         // Auto Delivery: User ආපසු Telegram එකට එද්දී Files යවා තිබීම
         if (!userData.delivered) {
           userData.delivered = true;
-          await sendBatchFiles(env, userId, userData.startMsg, userData.endMsg);
+          tgResults = await sendBatchFiles(env, userId, userData.startMsg, userData.endMsg);
         }
 
         await env.BOT_KV.put(userKey, JSON.stringify(userData), { expirationTtl: 3600 });
-        return new Response(JSON.stringify({ status: "success", delivered: true }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({ status: "success", delivered: true, telegram_response: tgResults }),
+          {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
       }
 
       return new Response("Pending session not found", { status: 404, headers: corsHeaders });
     }
 
-    // 2. Telegram Webhook Updates
+    // 3. Telegram Webhook Updates
     if (request.method === "POST") {
       try {
         const update = await request.json();
@@ -63,7 +94,6 @@ export default {
 
 // ================= TELEGRAM HANDLER =================
 async function handleTelegramUpdate(update, env) {
-  // A. Normal Messages & Commands
   if (update.message) {
     const msg = update.message;
     const chatId = msg.chat.id.toString();
@@ -71,7 +101,6 @@ async function handleTelegramUpdate(update, env) {
 
     // 1. Admin Features (Files Forward කර /done ගැසීම)
     if (chatId === env.ADMIN_ID.toString()) {
-      // Admin Files Forward කළ විට Storage Channel එකට Copy කිරීම
       if (msg.document || msg.video || msg.audio || msg.photo) {
         const res = await callTelegram(env.BOT_TOKEN, "copyMessage", {
           chat_id: env.STORAGE_CHANNEL_ID,
@@ -93,7 +122,6 @@ async function handleTelegramUpdate(update, env) {
         return;
       }
 
-      // Admin /done එබූ විට Base64 Link එක සාදා දීම
       if (text === "/done") {
         const batch = await env.BOT_KV.get("admin_batch", { type: "json" });
 
@@ -116,12 +144,10 @@ async function handleTelegramUpdate(update, env) {
           text: `✅ *Batch Link Created Successfully!*\n\n📁 *Files Count:* ${batch.length}\n🔢 *Range:* ${startId} to ${endId}\n\n🔗 *Your Link:*\n\`${finalLink}\`\n\n_(Link එක උඩ Click කර Copy කරගන්න)_`,
         });
 
-        // Batch Queue එක Clear කිරීම
         await env.BOT_KV.delete("admin_batch");
         return;
       }
 
-      // Batch එක අස්ථානගත කිරීමට /cancel
       if (text === "/cancel") {
         await env.BOT_KV.delete("admin_batch");
         await callTelegram(env.BOT_TOKEN, "sendMessage", {
@@ -132,13 +158,13 @@ async function handleTelegramUpdate(update, env) {
       }
     }
 
-    // 2. User /start Command (Deep Link එකෙන් පැමිණි විට)
+    // 2. User /start Command
     if (text.startsWith("/start")) {
       const parts = text.split(" ");
 
       if (parts.length > 1) {
         try {
-          const rawCode = atob(parts[1]); // Decode Base64 (උදා: get-10-18)
+          const rawCode = atob(parts[1]);
           const match = rawCode.match(/^get-(\d+)-(\d+)$/);
 
           if (!match) throw new Error("Invalid format");
@@ -146,7 +172,6 @@ async function handleTelegramUpdate(update, env) {
           const startMsg = parseInt(match[1]);
           const endMsg = parseInt(match[2]);
 
-          // User Session එක KV එකේ Save කිරීම
           await env.BOT_KV.put(
             `user_${chatId}`,
             JSON.stringify({
@@ -190,7 +215,7 @@ async function handleTelegramUpdate(update, env) {
     }
   }
 
-  // B. "I have clicked ads" Callback (Fallback Button)
+  // B. "I have clicked ads" Callback
   if (update.callback_query) {
     const cb = update.callback_query;
     const chatId = cb.from.id.toString();
@@ -208,7 +233,6 @@ async function handleTelegramUpdate(update, env) {
         return;
       }
 
-      // Ad එක බලලා Files දැනටමත් ගිහින් නම්
       if (data.delivered === true) {
         await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
           callback_query_id: cb.id,
@@ -218,7 +242,6 @@ async function handleTelegramUpdate(update, env) {
         return;
       }
 
-      // Ad එක බලා තිබේ නම් (නමුත් auto delivery නොවී නම්)
       if (data.verified === true) {
         data.delivered = true;
         await env.BOT_KV.put(userKey, JSON.stringify(data), { expirationTtl: 3600 });
@@ -231,7 +254,6 @@ async function handleTelegramUpdate(update, env) {
 
         await sendBatchFiles(env, chatId, data.startMsg, data.endMsg);
       } else {
-        // Ad එක නරඹා නැති විට හෝ තත්පර 5ට පෙර Back වූ විට
         await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
           callback_query_id: cb.id,
           text: "❌ ඔබ තවමත් Ad එක නරඹා නැත! කරුණාකර තත්පර 5ක් සම්පූර්ණයෙන් නරඹා නැවත උත්සාහ කරන්න.",
@@ -244,13 +266,16 @@ async function handleTelegramUpdate(update, env) {
 
 // Storage Channel එකෙන් Files ටික User ට යැවීම
 async function sendBatchFiles(env, chatId, startMsg, endMsg) {
+  let results = [];
   for (let msgId = startMsg; msgId <= endMsg; msgId++) {
-    await callTelegram(env.BOT_TOKEN, "copyMessage", {
+    const res = await callTelegram(env.BOT_TOKEN, "copyMessage", {
       chat_id: chatId,
       from_chat_id: env.STORAGE_CHANNEL_ID,
       message_id: msgId,
     });
+    results.push(res);
   }
+  return results;
 }
 
 // Telegram API Call Helper
