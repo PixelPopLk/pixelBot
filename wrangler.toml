@@ -1,3 +1,18 @@
 name = "pixelbot"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
+
+# 🛡️ Dashboard එකේ Variables සහ Secrets මකා දැමීම වලක්වන Flag එක:
+keep_vars = true
+
+# 📌 නිතර Reset නොවිය යුතු Variables මෙතනම Save කර තැබීම:
+[vars]
+STORAGE_CHANNEL_ID = "-1004297192169"
+ADMIN_ID = "6857599209"
+BOT_USERNAME = "PixelPopStorebot"
+WEBSITE_URL = "https://pixelpoplk.pages.dev"
+
+# Main Channel Force Sub තොරතුරු (ඔයාගේ Channel Link & ID එක මෙතනට දාන්න):
+FORCE_SUB_CHANNEL_ID = "-1003677392472"
+FORCE_SUB_CHANNEL_LINK = "https://t.me/pixel_pop_lk"
+FORCE_SUB_CHANNEL_NAME = "PixelPop LK"
