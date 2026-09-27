@@ -36,12 +36,17 @@ export default {
     if (url.pathname === "/test") {
       const secret = url.searchParams.get("secret");
       if (secret !== env.ADMIN_ID) {
-        return new Response(JSON.stringify({ error: "Unauthorized access" }), {
+        return new Response(JSON.stringify({ error: "Unauthorized access. Pass ?secret=" + (env.ADMIN_ID || "YOUR_ADMIN_ID") }), {
           status: 401,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
 
+      // Auto migrate schema if needed
+      await ensureSchema(env);
+
+      const botInfo = await callTelegram(env.BOT_TOKEN, "getMe", {});
+      const webhookInfo = await callTelegram(env.BOT_TOKEN, "getWebhookInfo", {});
       const storageCheck = await callTelegram(env.BOT_TOKEN, "getChat", {
         chat_id: env.STORAGE_CHANNEL_ID,
       });
@@ -62,6 +67,8 @@ export default {
       return new Response(
         JSON.stringify(
           {
+            bot_info: botInfo,
+            webhook_info: webhookInfo,
             database_status: d1Status,
             total_users: userCount,
             storage_channel: storageCheck?.ok ? "Connected" : storageCheck,
@@ -1087,8 +1094,13 @@ function isUserVipActive(user) {
 }
 
 async function getUserLang(env, chatId) {
-  const u = await env.DB.prepare(`SELECT language FROM users WHERE user_id = ?`).bind(chatId).first();
-  return u?.language || "si";
+  if (!env.DB) return "si";
+  try {
+    const u = await env.DB.prepare(`SELECT language FROM users WHERE user_id = ?`).bind(chatId).first();
+    return u?.language || "si";
+  } catch {
+    return "si";
+  }
 }
 
 async function checkUserSubscription(env, userId) {
@@ -1128,13 +1140,84 @@ async function sendForceSubMessage(env, chatId, payload) {
 async function ensureUserExists(env, user) {
   if (!user || !env.DB) return;
   const userId = user.id.toString();
-  await env.DB.prepare(`
-    INSERT INTO users (user_id, username, first_name, created_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET
-      username = excluded.username,
-      first_name = excluded.first_name
-  `).bind(userId, user.username || null, user.first_name || null, Date.now()).run();
+  try {
+    await env.DB.prepare(`
+      INSERT INTO users (user_id, username, first_name, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        username = excluded.username,
+        first_name = excluded.first_name
+    `).bind(userId, user.username || null, user.first_name || null, Date.now()).run();
+  } catch (err) {
+    // Fallback: If table is not migrated with new columns yet, insert user_id only
+    try {
+      await env.DB.prepare(`
+        INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING
+      `).bind(userId).run();
+    } catch {}
+  }
+}
+
+async function ensureSchema(env) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS batches (
+        token TEXT PRIMARY KEY,
+        title TEXT,
+        msg_ids TEXT NOT NULL,
+        created_by TEXT,
+        created_at INTEGER
+      )
+    `).run();
+
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS vip_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        user_name TEXT,
+        file_id TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at INTEGER
+      )
+    `).run();
+
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        currency TEXT NOT NULL,
+        telegram_charge_id TEXT,
+        status TEXT DEFAULT 'completed',
+        created_at INTEGER
+      )
+    `).run();
+
+    // Auto-add new columns to existing users & deletions tables if missing
+    const migrations = [
+      "ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'si'",
+      "ALTER TABLE users ADD COLUMN username TEXT",
+      "ALTER TABLE users ADD COLUMN first_name TEXT",
+      "ALTER TABLE users ADD COLUMN is_vip INTEGER DEFAULT 0",
+      "ALTER TABLE users ADD COLUMN vip_until INTEGER DEFAULT 0",
+      "ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0",
+      "ALTER TABLE users ADD COLUMN referred_by TEXT",
+      "ALTER TABLE users ADD COLUMN created_at INTEGER",
+      "ALTER TABLE deletions ADD COLUMN reminded INTEGER DEFAULT 0",
+    ];
+
+    for (const q of migrations) {
+      try {
+        await env.DB.prepare(q).run();
+      } catch {
+        // Ignored if column already exists
+      }
+    }
+  } catch (err) {
+    console.error("Schema ensure error:", err);
+  }
 }
 
 async function sendReply(env, chatId, htmlText) {
