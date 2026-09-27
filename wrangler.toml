@@ -16,3 +16,14 @@ WEBSITE_URL = "https://pixelpoplk.pages.dev"
 FORCE_SUB_CHANNEL_ID = "-1003677392472"
 FORCE_SUB_CHANNEL_LINK = "https://t.me/pixel_pop_lk"
 FORCE_SUB_CHANNEL_NAME = "PixelPop LK"
+
+# ⏰ Cron Trigger: සෑම විනාඩි 10කට වරක් Auto-Deletion සහ Reminder ක්‍රියාත්මක කිරීම
+[triggers]
+crons = ["*/10 * * * *"]
+
+# 🗄️ Cloudflare D1 Database Binding (ඔබේ Database Name & ID එක ඇතුළත් කරන්න):
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "pixelpop-db"
+# database_id = "your-d1-database-id-here"
+
