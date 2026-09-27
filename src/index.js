@@ -2,13 +2,15 @@
  * PixelPop Telegram File Store Bot (Cloudflare Worker + D1 Database)
  * Features:
  * - Scalable, serverless Cloudflare Worker architecture
- * - Multi-tier Monetization: Telegram Stars (XTR), Local VIP (Bank Slip verification), Rewarded Ads
- * - Viral Referral Engine (Invite 3 friends for Free 24h VIP)
- * - Secure UUID-based Batch Links with full Backward Compatibility for old links
- * - Rich Movie Previews, Bilingual UX (සිංහල & English)
- * - Auto-Deletion (6-hour limit for free users) with Smart 30-minute Expiry Reminders
- * - Admin Broadcast Engine & Real-Time Stats
+ * - Multi-tier Monetization: Telegram Stars (60 Stars), Local BOC Bank (LKR 350), Rewarded Ads
+ * - Auto-Expiring VIP Subscriptions (Auto removed after 30 days)
+ * - Protected Content: Forwarding & saving disabled (protect_content: true)
+ * - Episode-by-Episode Links (Free) + Complete Season Pack (VIP 1-Click)
+ * - Self-Healing D1 Database with Automatic Schema Migrations
+ * - Admin File Ingestion, Broadcast Engine & Real-Time Stats
  */
+
+let isSchemaMigrated = false;
 
 export default {
   // 1. Scheduled Cron Event (ක්‍රියාත්මක වන්නේ සෑම විනාඩි 10කට වරක්)
@@ -29,21 +31,23 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Lazy cleanup & reminders on incoming requests as fallback
-    ctx.waitUntil(handleScheduledTasks(env));
+    // Optimize D1: Only ensure schema once per worker isolate lifecycle
+    if (!isSchemaMigrated) {
+      await ensureSchema(env);
+    }
 
     // 🔍 1. SYSTEM DIAGNOSTIC TEST (Protected by Admin ID or Secret)
     if (url.pathname === "/test") {
       const secret = url.searchParams.get("secret");
       if (secret !== env.ADMIN_ID) {
-        return new Response(JSON.stringify({ error: "Unauthorized access. Pass ?secret=" + (env.ADMIN_ID || "YOUR_ADMIN_ID") }), {
-          status: 401,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({ error: "Unauthorized access. Pass ?secret=" + (env.ADMIN_ID || "YOUR_ADMIN_ID") }),
+          {
+            status: 401,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
       }
-
-      // Auto migrate schema if needed
-      await ensureSchema(env);
 
       const botInfo = await callTelegram(env.BOT_TOKEN, "getMe", {});
       const webhookInfo = await callTelegram(env.BOT_TOKEN, "getWebhookInfo", {});
@@ -139,11 +143,15 @@ async function handleTelegramUpdate(update, env) {
 // ================= MESSAGE HANDLER =================
 async function handleMessage(msg, env) {
   const chatId = msg.chat.id.toString();
-  const text = (msg.text || "").trim();
+  const text = (msg.text || msg.caption || "").trim();
   const user = msg.from;
 
-  // Track / register user in D1
-  await ensureUserExists(env, user);
+  // Track / register user in D1 safely
+  try {
+    await ensureUserExists(env, user);
+  } catch (err) {
+    console.error("ensureUserExists error:", err);
+  }
 
   // ⭐️ 1. Successful Telegram Stars Payment Receipt
   if (msg.successful_payment) {
@@ -151,16 +159,11 @@ async function handleMessage(msg, env) {
     return;
   }
 
-  // 📸 2. Photo Upload (Bank Slip for VIP verification)
-  if (msg.photo && msg.photo.length > 0) {
-    await handleSlipUpload(msg, env);
-    return;
-  }
-
-  // 👑 3. ADMIN-ONLY COMMANDS & FILE INGESTION
   const isAdmin = chatId === env.ADMIN_ID?.toString();
+
+  // 👑 2. ADMIN-ONLY COMMANDS & FILE INGESTION
   if (isAdmin) {
-    // A. Forwarded or Direct File Upload to Storage Channel
+    // A. Admin File Uploads (Videos, Documents, Photos, Audios, Forwards)
     if (!text.startsWith("/")) {
       await handleAdminFileUpload(msg, env);
       return;
@@ -169,7 +172,11 @@ async function handleMessage(msg, env) {
     // B. Admin Commands
     if (text.startsWith("/add ")) {
       const customTitle = text.replace("/add ", "").trim();
-      await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
+      try {
+        await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
+      } catch {
+        await env.DB.prepare(`DELETE FROM admin_batch`).run();
+      }
       await env.DB.prepare(`
         INSERT INTO users (user_id, msg_ids) VALUES ('admin_title_draft', ?)
         ON CONFLICT(user_id) DO UPDATE SET msg_ids = excluded.msg_ids
@@ -177,7 +184,7 @@ async function handleMessage(msg, env) {
       await sendReply(
         env,
         chatId,
-        `🎬 <b>Ready to Add:</b> <i>${escapeHtml(customTitle)}</i>\n━━━━━━━━━━━━━━━━━━━━\nForward all episodes or movie files now. When finished, send /done or click Generate Link.`
+        `🎬 <b>Ready to Add:</b> <i>${escapeHtml(customTitle)}</i>\n━━━━━━━━━━━━━━━━━━━━\nForward all episodes or movie files now. When finished, send /done or click Generate Links.`
       );
       return;
     }
@@ -188,7 +195,11 @@ async function handleMessage(msg, env) {
     }
 
     if (text.startsWith("/cancel")) {
-      await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
+      try {
+        await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
+      } catch {
+        await env.DB.prepare(`DELETE FROM admin_batch`).run();
+      }
       await sendReply(env, chatId, "🗑️ <b>Batch Cleared!</b> / <b>Batch එක ඉවත් කරන ලදී.</b>");
       return;
     }
@@ -199,7 +210,7 @@ async function handleMessage(msg, env) {
         INSERT INTO users (user_id, msg_ids) VALUES ('admin_title_draft', ?)
         ON CONFLICT(user_id) DO UPDATE SET msg_ids = excluded.msg_ids
       `).bind(customTitle).run();
-      await sendReply(env, chatId, `🏷️ <b>Batch Title Set:</b> <i>${escapeHtml(customTitle)}</i>\nNow forward your files or click Generate Link.`);
+      await sendReply(env, chatId, `🏷️ <b>Batch Title Set:</b> <i>${escapeHtml(customTitle)}</i>\nNow forward your files or click Generate Links.`);
       return;
     }
 
@@ -213,6 +224,12 @@ async function handleMessage(msg, env) {
       await handleBroadcast(env, chatId, broadcastMsg);
       return;
     }
+  }
+
+  // 📸 3. Non-Admin Photo Upload (Bank Slip for VIP verification)
+  if (msg.photo && msg.photo.length > 0) {
+    await handleSlipUpload(msg, env);
+    return;
   }
 
   // 🌐 4. GENERAL USER COMMANDS
@@ -320,23 +337,40 @@ async function handleAdminFileUpload(msg, env) {
     if (res.ok) {
       channelMsgId = res.result.message_id;
     } else {
-      await sendReply(env, chatId, `❌ Error copying to storage channel: ${res.description || "Unknown"}`);
+      await sendReply(
+        env,
+        chatId,
+        `❌ <b>Error copying to Storage Channel:</b> ${res.description || "Unknown"}\n\n⚠️ කරුණාකර Bot ඔබේ Storage Channel (<code>${env.STORAGE_CHANNEL_ID}</code>) එකේ <b>Administrator</b> කෙනෙක් කර 'Post Messages' permission ලබා දී ඇතිදැයි බලන්න!`
+      );
       return;
     }
   }
 
-  // Insert into admin batch queue
-  await env.DB.prepare(`
-    INSERT INTO admin_batch (admin_id, message_id) VALUES (?, ?)
-  `).bind(chatId, channelMsgId).run();
+  // Insert into admin batch queue (fail-safe)
+  try {
+    await env.DB.prepare(`
+      INSERT INTO admin_batch (admin_id, message_id) VALUES (?, ?)
+    `).bind(chatId, channelMsgId).run();
+  } catch (e) {
+    await env.DB.prepare(`
+      INSERT INTO admin_batch (message_id) VALUES (?)
+    `).bind(channelMsgId).run();
+  }
 
-  const countRes = await env.DB.prepare(`
-    SELECT COUNT(*) as count FROM admin_batch WHERE admin_id = ?
-  `).bind(chatId).first();
+  let count = 1;
+  try {
+    const countRes = await env.DB.prepare(`
+      SELECT COUNT(*) as count FROM admin_batch WHERE admin_id = ?
+    `).bind(chatId).first();
+    count = countRes?.count || 1;
+  } catch {
+    const countRes = await env.DB.prepare(`SELECT COUNT(*) as count FROM admin_batch`).first();
+    count = countRes?.count || 1;
+  }
 
   const adminKb = {
     inline_keyboard: [
-      [{ text: "🔗 Generate Link Now / Link එක සාදන්න", callback_data: "admin_done" }],
+      [{ text: "🔗 Generate Links Now / Links සාදන්න", callback_data: "admin_done" }],
       [{ text: "🗑️ Cancel Batch / අවලංගු කරන්න", callback_data: "admin_cancel" }],
     ],
   };
@@ -344,7 +378,7 @@ async function handleAdminFileUpload(msg, env) {
   await callTelegram(env.BOT_TOKEN, "sendMessage", {
     chat_id: chatId,
     parse_mode: "HTML",
-    text: `📥 <b>File Saved to Queue!</b> (ID: <code>${channelMsgId}</code>)\nTotal files in batch: <b>${countRes?.count || 1}</b>\n\nForward more files, or click below to generate link:`,
+    text: `📥 <b>File Saved to Storage Channel!</b> (ID: <code>${channelMsgId}</code>)\nTotal files in batch: <b>${count}</b>\n\nForward more files, or click below to generate links:`,
     reply_markup: adminKb,
   });
 }
@@ -357,7 +391,11 @@ async function handleCallbackQuery(cb, env) {
   // 1. Language Toggle
   if (data === "set_lang_si" || data === "set_lang_en") {
     const newLang = data === "set_lang_si" ? "si" : "en";
-    await env.DB.prepare(`UPDATE users SET language = ? WHERE user_id = ?`).bind(newLang, chatId).run();
+    try {
+      await env.DB.prepare(`UPDATE users SET language = ? WHERE user_id = ?`).bind(newLang, chatId).run();
+    } catch (e) {
+      console.error("Language update error:", e);
+    }
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: cb.id,
       text: newLang === "si" ? "✅ භාෂාව සිංහල ලෙස සකසන ලදී!" : "✅ Language set to English!",
@@ -377,7 +415,11 @@ async function handleCallbackQuery(cb, env) {
   }
 
   if (data === "admin_cancel" && chatId === env.ADMIN_ID?.toString()) {
-    await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
+    try {
+      await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
+    } catch {
+      await env.DB.prepare(`DELETE FROM admin_batch`).run();
+    }
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: cb.id,
       text: "🗑️ Batch Cleared!",
@@ -425,19 +467,19 @@ async function handleCallbackQuery(cb, env) {
     return;
   }
 
-  // 5. 30-Day VIP Purchase via Stars (150 Stars)
+  // 5. 30-Day VIP Purchase via Stars (60 Stars)
   if (data === "buy_vip_stars_30d") {
     await sendStarsInvoice(env, chatId, {
       title: "👑 30-Day VIP Pass",
       description: "Unlimited ad-free downloads + permanent files for 30 days!",
       payload: "vip_30d",
-      starsAmount: 150,
+      starsAmount: 60, // ⭐️ 60 Stars for 30 days VIP
     });
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
     return;
   }
 
-  // 6. VIP Bank Slip Request Initiation
+  // 6. VIP BOC Bank Slip Request Initiation
   if (data === "vip_pay_bank") {
     await sendBankPaymentInstructions(env, chatId);
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
@@ -685,40 +727,79 @@ async function handleScheduledTasks(env) {
 
   const now = Date.now();
 
-  // 1. Send 30-Minute Expiry Reminders
-  const thirtyMinsFromNow = now + 30 * 60 * 1000;
-  const pendingReminders = await env.DB.prepare(`
-    SELECT DISTINCT chat_id FROM deletions
-    WHERE delete_at <= ? AND reminded = 0
-    LIMIT 20
-  `).bind(thirtyMinsFromNow).all();
+  // 1. Auto-Expire Expired VIP Subscriptions (Monthly users)
+  try {
+    const expiredVips = await env.DB.prepare(`
+      SELECT user_id FROM users
+      WHERE is_vip = 1 AND vip_until > 0 AND vip_until <= ?
+      LIMIT 50
+    `).bind(now).all();
 
-  if (pendingReminders.results && pendingReminders.results.length > 0) {
-    for (const r of pendingReminders.results) {
-      await callTelegram(env.BOT_TOKEN, "sendMessage", {
-        chat_id: r.chat_id,
-        parse_mode: "HTML",
-        text: "⏰ <b>REMINDER / මතක් කිරීමක්:</b>\nඔබ බාගත කළ Files තවත් <b>විනාඩි 30කින් ස්වයංක්‍රීයව මැකී යනු ඇත!</b> කරුණාකර දැන්ම Saved Messages වෙත Forward කරගන්න.",
-      });
-      await env.DB.prepare(`
-        UPDATE deletions SET reminded = 1 WHERE chat_id = ?
-      `).bind(r.chat_id).run();
+    if (expiredVips?.results && expiredVips.results.length > 0) {
+      for (const u of expiredVips.results) {
+        await env.DB.prepare(`
+          UPDATE users SET is_vip = 0 WHERE user_id = ?
+        `).bind(u.user_id).run();
+
+        // Send friendly notification to user
+        await callTelegram(env.BOT_TOKEN, "sendMessage", {
+          chat_id: u.user_id,
+          parse_mode: "HTML",
+          text: "⏰ <b>VIP Membership Expired / VIP කාලය අවසන් විය:</b>\nඔබගේ දින 30ක VIP සාමාජිකත්වය අවසන් වී ඇත. නැවත VIP ලබා ගැනීමට /vip භාවිතා කරන්න.",
+        });
+      }
     }
+  } catch (err) {
+    console.error("VIP auto-expiry error:", err);
   }
 
-  // 2. Clean Expired Messages
-  const expired = await env.DB.prepare(`
-    SELECT * FROM deletions WHERE delete_at <= ? LIMIT 50
-  `).bind(now).all();
+  // 2. Send 30-Minute Expiry Reminders
+  try {
+    const thirtyMinsFromNow = now + 30 * 60 * 1000;
+    const pendingReminders = await env.DB.prepare(`
+      SELECT DISTINCT chat_id FROM deletions
+      WHERE delete_at <= ? AND reminded = 0
+      LIMIT 20
+    `).bind(thirtyMinsFromNow).all();
 
-  if (expired.results && expired.results.length > 0) {
-    for (const item of expired.results) {
-      await callTelegram(env.BOT_TOKEN, "deleteMessage", {
-        chat_id: item.chat_id,
-        message_id: item.message_id,
-      });
-      await env.DB.prepare(`DELETE FROM deletions WHERE id = ?`).bind(item.id).run();
+    if (pendingReminders?.results && pendingReminders.results.length > 0) {
+      for (const r of pendingReminders.results) {
+        await callTelegram(env.BOT_TOKEN, "sendMessage", {
+          chat_id: r.chat_id,
+          parse_mode: "HTML",
+          text: "⏰ <b>REMINDER / මතක් කිරීමක්:</b>\nඔබ බාගත කළ Files තවත් <b>විනාඩි 30කින් ස්වයංක්‍රීයව මැකී යනු ඇත!</b> කරුණාකර දැන්ම Saved Messages වෙත Forward කරගන්න.",
+        });
+        await env.DB.prepare(`
+          UPDATE deletions SET reminded = 1 WHERE chat_id = ?
+        `).bind(r.chat_id).run();
+      }
     }
+  } catch (err) {
+    console.error("Reminder queue error:", err);
+  }
+
+  // 3. Clean Expired Messages
+  try {
+    const expired = await env.DB.prepare(`
+      SELECT * FROM deletions WHERE delete_at <= ? LIMIT 50
+    `).bind(now).all();
+
+    if (expired?.results && expired.results.length > 0) {
+      let deletedIds = [];
+      for (const item of expired.results) {
+        await callTelegram(env.BOT_TOKEN, "deleteMessage", {
+          chat_id: item.chat_id,
+          message_id: item.message_id,
+        });
+        deletedIds.push(item.id);
+      }
+      if (deletedIds.length > 0) {
+        const placeholders = deletedIds.map(() => '?').join(',');
+        await env.DB.prepare(`DELETE FROM deletions WHERE id IN (${placeholders})`).bind(...deletedIds).run();
+      }
+    }
+  } catch (err) {
+    console.error("Message deletion queue error:", err);
   }
 }
 
@@ -778,16 +859,16 @@ async function handleSuccessfulPayment(msg, env) {
   }
 }
 
-// ================= LOCAL VIP & BANK SLIP SYSTEM =================
+// ================= LOCAL VIP & BOC BANK SLIP SYSTEM =================
 async function sendVipInfoCard(env, chatId) {
   const keyboard = {
     inline_keyboard: [
-      [{ text: "⭐️ Buy with 150 Stars (Instant)", callback_data: "buy_vip_stars_30d" }],
-      [{ text: "💳 Bank Transfer / FriMi / eZ Cash (LKR 350)", callback_data: "vip_pay_bank" }],
+      [{ text: "⭐️ Buy with 60 Stars (Instant)", callback_data: "buy_vip_stars_30d" }],
+      [{ text: "🏛️ Bank of Ceylon (BOC) - LKR 350", callback_data: "vip_pay_bank" }],
     ],
   };
 
-  const text = `👑 <b>PixelPop VIP Membership Club</b>\n━━━━━━━━━━━━━━━━━━━━\n🌟 <b>VIP වාසි:</b>\n• කිසිදු Ad එකක් නැත (100% Ad-Free)\n• Files පැය 6කින් මැකී යන්නේ නැත (Permanent Access)\n• One-click Instant Downloads\n\n💰 <b>මිල ගණන්:</b>\n• 30 Days VIP: <b>LKR 350/=</b> හෝ <b>⭐️ 150 Stars</b>\n━━━━━━━━━━━━━━━━━━━━\nපහතින් ඔබට පහසු ගෙවීම් ක්‍රමය තෝරන්න:`;
+  const text = `👑 <b>PixelPop VIP Membership Club</b>\n━━━━━━━━━━━━━━━━━━━━\n🌟 <b>VIP වාසි:</b>\n• කිසිදු Ad එකක් නැත (100% Ad-Free)\n• Files පැය 6කින් මැකී යන්නේ නැත (Permanent Access)\n• One-click Season Packs Instant Downloads\n\n💰 <b>මිල ගණන්:</b>\n• 30 Days VIP: <b>LKR 350/=</b> හෝ <b>⭐️ 60 Stars</b>\n━━━━━━━━━━━━━━━━━━━━\nපහතින් ඔබට පහසු ගෙවීම් ක්‍රමය තෝරන්න:`;
 
   await callTelegram(env.BOT_TOKEN, "sendMessage", {
     chat_id: chatId,
@@ -798,7 +879,10 @@ async function sendVipInfoCard(env, chatId) {
 }
 
 async function sendBankPaymentInstructions(env, chatId) {
-  const bankMsg = `💳 <b>Bank Transfer / FriMi / eZ Cash Instructions:</b>\n━━━━━━━━━━━━━━━━━━━━\nගාස්තුව: <b>LKR 350/= (දින 30ක් සඳහා)</b>\n\n🏛️ <b>Bank Details:</b>\n• <b>Bank:</b> Commercial Bank / HNB\n• <b>Account Name:</b> PixelPop LK\n• <b>Account Number:</b> <code>XXXXXXXXXX</code>\n• <b>Branch:</b> Colombo\n\n📱 <b>FriMi / eZ Cash:</b>\n• <b>Mobile:</b> <code>07X XXXXXXX</code>\n━━━━━━━━━━━━━━━━━━━━\n📸 <b>පියවර:</b>\nමුදල් තැන්පත් කළ පසු, ලැබෙන <b>Deposit Slip එකේ හෝ Screenshot එකේ ඡායාරූපයක් (Photo) මෙම Bot වෙත එවන්න.</b>\nඅපගේ Admin පරීක්ෂා කර සුළු වේලාවකින් ඔබගේ VIP සක්‍රීය කරනු ඇත!`;
+  const bocAcc = env.BOC_ACCOUNT_NUMBER || "1234567890";
+  const bocName = env.BOC_ACCOUNT_NAME || "R.M.P. Madusanka";
+
+  const bankMsg = `🏛️ <b>Bank of Ceylon (BOC) Payment Details:</b>\n━━━━━━━━━━━━━━━━━━━━\nගාස්තුව: <b>LKR 350/= (දින 30ක් සඳහා)</b>\n\n📋 <b>බැංකු ගිණුම් විස්තර:</b>\n• <b>Bank:</b> Bank of Ceylon (BOC)\n• <b>Account Name:</b> ${bocName}\n• <b>Account Number:</b> <code>${bocAcc}</code>\n• <b>Branch:</b> Sri Lanka\n━━━━━━━━━━━━━━━━━━━━\n📸 <b>පියවර:</b>\n1. ඉහත ගිණුමට LKR 350/= තැන්පත් කරන්න.\n2. ලැබෙන <b>Deposit Slip එකේ හෝ Online Banking Screenshot එකේ ඡායාරූපයක් (Photo) මෙම Bot වෙත එවන්න.</b>\n3. Admin පරීක්ෂා කර සුළු වේලාවකින් ඔබගේ VIP සක්‍රීය කරනු ඇත!`;
 
   await sendReply(env, chatId, bankMsg);
 }
@@ -809,19 +893,26 @@ async function handleSlipUpload(msg, env) {
   const highestPhoto = msg.photo[msg.photo.length - 1];
   const fileId = highestPhoto.file_id;
 
-  // Save to DB
-  const insertRes = await env.DB.prepare(`
-    INSERT INTO vip_requests (user_id, user_name, file_id, status, created_at)
-    VALUES (?, ?, ?, 'pending', ?)
-  `).bind(chatId, userName, fileId, Date.now()).run();
+  await ensureSchema(env);
 
-  const reqId = insertRes.meta.last_row_id;
+  let reqId = Date.now();
+  try {
+    const insertRes = await env.DB.prepare(`
+      INSERT INTO vip_requests (user_id, user_name, file_id, status, created_at)
+      VALUES (?, ?, ?, 'pending', ?)
+    `).bind(chatId, userName, fileId, Date.now()).run();
+    if (insertRes?.meta?.last_row_id) {
+      reqId = insertRes.meta.last_row_id;
+    }
+  } catch (e) {
+    console.error("vip_requests insert error:", e);
+  }
 
   // Notify User
   await sendReply(
     env,
     chatId,
-    "✅ <b>Receipt Received!</b> / ඔබගේ රිසිට්පත ලැබුණි.\nඅපගේ Admin විසින් මෙය පරීක්ෂා කර විනාඩි කිහිපයකින් ඔබගේ VIP Pass එක සක්‍රීය කරනු ඇත."
+    "✅ <b>Receipt Received!</b> / ඔබගේ බැංකු රිසිට්පත ලැබුණි.\nඅපගේ Admin විසින් මෙය පරීක්ෂා කර සුළු වේලාවකින් ඔබගේ VIP සක්‍රීය කරනු ඇත."
   );
 
   // Forward to Admin with Action Buttons
@@ -834,13 +925,25 @@ async function handleSlipUpload(msg, env) {
     ],
   };
 
-  await callTelegram(env.BOT_TOKEN, "sendPhoto", {
+  const adminCaption = `👑 <b>New VIP Subscription Request #${reqId}</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 <b>User:</b> ${userName} (<code>${chatId}</code>)\n💵 <b>Plan:</b> 30-Day VIP (LKR 350 - BOC Bank)\n━━━━━━━━━━━━━━━━━━━━`;
+
+  const sendRes = await callTelegram(env.BOT_TOKEN, "sendPhoto", {
     chat_id: env.ADMIN_ID,
     photo: fileId,
-    caption: `👑 <b>New VIP Subscription Request #${reqId}</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 <b>User:</b> ${userName} (<code>${chatId}</code>)\n💵 <b>Plan:</b> 30-Day VIP (LKR 350)\n━━━━━━━━━━━━━━━━━━━━`,
+    caption: adminCaption,
     parse_mode: "HTML",
     reply_markup: adminKb,
   });
+
+  if (!sendRes.ok) {
+    // Fallback: send text alert first so admin definitely gets notified
+    await callTelegram(env.BOT_TOKEN, "sendMessage", {
+      chat_id: env.ADMIN_ID,
+      text: adminCaption,
+      parse_mode: "HTML",
+      reply_markup: adminKb,
+    });
+  }
 }
 
 async function handleAdminVipApproval(env, adminChatId, reqId, isApproved) {
@@ -860,7 +963,7 @@ async function handleAdminVipApproval(env, adminChatId, reqId, isApproved) {
     await sendReply(
       env,
       req.user_id,
-      "🎉 <b>VIP Membership Activated!</b>\n━━━━━━━━━━━━━━━━━━━━\nඔබගේ රිසිට්පත තහවුරු විය. දින 30ක VIP සාමාජිකත්වය සක්‍රීය කර ඇත. කිසිදු Ad එකක් නැතිව Files බාගත කරගත හැක!"
+      "🎉 <b>VIP Membership Activated!</b>\n━━━━━━━━━━━━━━━━━━━━\nඔබගේ BOC බැංකු රිසිට්පත තහවුරු විය. දින 30ක VIP සාමාජිකත්වය සක්‍රීය කර ඇත. කිසිදු Ad එකක් නැතිව Files බාගත කරගත හැක!"
     );
 
     await sendReply(env, adminChatId, `✅ Approved VIP for User ${req.user_id}`);
@@ -938,7 +1041,7 @@ async function grantReferralIfPending(env, userId) {
     const refUser = await env.DB.prepare(`SELECT * FROM users WHERE user_id = ?`).bind(referrerId).first();
     const count = refUser?.referral_count || 1;
 
-    // Award 24-hour VIP pass every 3 referrals
+    // Award 24-hour VIP pass every 3 referrals (stacks automatically)
     if (count % 3 === 0) {
       const oneDay = 24 * 60 * 60 * 1000;
       const currentExpiry = (refUser.is_vip && refUser.vip_until > Date.now()) ? refUser.vip_until : Date.now();
@@ -965,11 +1068,18 @@ async function grantReferralIfPending(env, userId) {
 
 // ================= ADMIN HELPERS & BROADCAST =================
 async function generateBatchLink(env, chatId) {
-  const batchRes = await env.DB.prepare(`
-    SELECT message_id FROM admin_batch WHERE admin_id = ? ORDER BY id ASC
-  `).bind(chatId).all();
+  let batchRes;
+  try {
+    batchRes = await env.DB.prepare(`
+      SELECT message_id FROM admin_batch WHERE admin_id = ? ORDER BY id ASC
+    `).bind(chatId).all();
+  } catch {
+    batchRes = await env.DB.prepare(`
+      SELECT message_id FROM admin_batch ORDER BY id ASC
+    `).all();
+  }
 
-  const batch = (batchRes.results || []).map((r) => r.message_id);
+  const batch = (batchRes?.results || []).map((r) => r.message_id);
 
   if (!batch || batch.length === 0) {
     await sendReply(env, chatId, "⚠️ No files in queue! Please forward some files first or use /add <Title>.");
@@ -979,10 +1089,14 @@ async function generateBatchLink(env, chatId) {
   const uniqueIds = [...new Set(batch)];
 
   // Check if admin prepared a custom title
-  const draftTitle = await env.DB.prepare(`
-    SELECT msg_ids FROM users WHERE user_id = 'admin_title_draft'
-  `).first();
-  const title = draftTitle?.msg_ids || "PixelPop Release";
+  let title = "PixelPop Release";
+  try {
+    const draftTitle = await env.DB.prepare(`
+      SELECT msg_ids FROM users WHERE user_id = 'admin_title_draft'
+    `).first();
+    if (draftTitle?.msg_ids) title = draftTitle.msg_ids;
+  } catch {}
+
   const botUsername = env.BOT_USERNAME || "PixelPopStorebot";
 
   let channelPostText = "";
@@ -996,7 +1110,7 @@ async function generateBatchLink(env, chatId) {
     `).bind(token, title, JSON.stringify(uniqueIds), chatId, Date.now()).run();
 
     const link = `https://t.me/${botUsername}?start=${token}`;
-    channelPostText = `🎬 <b>${escapeHtml(title)}</b>\n━━━━━━━━━━━━━━━━━━━━\n📁 <b>Status:</b> Ready for Download\n⚡ <b>VIP Access:</b> Instant 0 Ads\n🆓 <b>Free Access:</b> Watch 5s Sponsor Ad\n━━━━━━━━━━━━━━━━━━━━\n👇 <b>Download Link:</b>\n🔗 <a href="${link}">${escapeHtml(title)}</a>`;
+    channelPostText = `🎬 <b>${escapeHtml(title)}</b>\n━━━━━━━━━━━━━━━━━━━━\n📁 <b>Status:</b> Ready for Download\n⚡ <b>VIP Access:</b> Instant 0 Ads (No Delete)\n🆓 <b>Free Access:</b> Watch 5s Sponsor Ad\n━━━━━━━━━━━━━━━━━━━━\n👇 <b>Download Link:</b>\n🔗 <a href="${link}">${escapeHtml(title)}</a>`;
 
     await callTelegram(env.BOT_TOKEN, "sendMessage", {
       chat_id: chatId,
@@ -1053,17 +1167,22 @@ async function generateBatchLink(env, chatId) {
   }
 
   // Clear admin draft title & batch queue
-  await env.DB.prepare(`DELETE FROM users WHERE user_id = 'admin_title_draft'`).run();
-  await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
+  try {
+    await env.DB.prepare(`DELETE FROM users WHERE user_id = 'admin_title_draft'`).run();
+    await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
+  } catch {
+    await env.DB.prepare(`DELETE FROM admin_batch`).run();
+  }
 }
 
 async function handleAdminStats(env, chatId) {
-  const totalUsers = await env.DB.prepare(`SELECT COUNT(*) as c FROM users`).first();
+  const totalUsers = await env.DB.prepare(`SELECT COUNT(*) as c FROM users WHERE user_id NOT LIKE 'admin_%'`).first();
   const activeVip = await env.DB.prepare(`SELECT COUNT(*) as c FROM users WHERE is_vip = 1 AND vip_until > ?`).bind(Date.now()).first();
   const totalBatches = await env.DB.prepare(`SELECT COUNT(*) as c FROM batches`).first();
   const queueSize = await env.DB.prepare(`SELECT COUNT(*) as c FROM deletions`).first();
+  const pendingSlips = await env.DB.prepare(`SELECT COUNT(*) as c FROM vip_requests WHERE status = 'pending'`).first();
 
-  const text = `📊 <b>PixelPop System Dashboard:</b>\n━━━━━━━━━━━━━━━━━━━━\n👥 <b>Total Registered Users:</b> ${totalUsers?.c || 0}\n👑 <b>Active VIP Members:</b> ${activeVip?.c || 0}\n📦 <b>Total Stored Batches:</b> ${totalBatches?.c || 0}\n🗑️ <b>Deletion Queue Size:</b> ${queueSize?.c || 0}\n━━━━━━━━━━━━━━━━━━━━`;
+  const text = `📊 <b>PixelPop System Dashboard:</b>\n━━━━━━━━━━━━━━━━━━━━\n👥 <b>Total Registered Users:</b> ${totalUsers?.c || 0}\n👑 <b>Active VIP Members:</b> ${activeVip?.c || 0}\n💳 <b>Pending Bank Slips:</b> ${pendingSlips?.c || 0}\n📦 <b>Total Stored Batches:</b> ${totalBatches?.c || 0}\n🗑️ <b>Deletion Queue Size:</b> ${queueSize?.c || 0}\n━━━━━━━━━━━━━━━━━━━━`;
 
   await sendReply(env, chatId, text);
 }
@@ -1114,7 +1233,7 @@ async function checkUserSubscription(env, userId) {
     });
 
     if (!res.ok) return true;
-    const status = res.result.status;
+    const status = res.result?.status;
     return ["creator", "administrator", "member", "restricted"].includes(status);
   } catch {
     return true;
@@ -1149,7 +1268,6 @@ async function ensureUserExists(env, user) {
         first_name = excluded.first_name
     `).bind(userId, user.username || null, user.first_name || null, Date.now()).run();
   } catch (err) {
-    // Fallback: If table is not migrated with new columns yet, insert user_id only
     try {
       await env.DB.prepare(`
         INSERT INTO users (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING
@@ -1159,8 +1277,33 @@ async function ensureUserExists(env, user) {
 }
 
 async function ensureSchema(env) {
-  if (!env.DB) return;
+  if (!env.DB || isSchemaMigrated) return;
   try {
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        language TEXT DEFAULT 'si',
+        msg_ids TEXT,
+        ad_started_at INTEGER,
+        delivered INTEGER DEFAULT 0,
+        is_vip INTEGER DEFAULT 0,
+        vip_until INTEGER DEFAULT 0,
+        referred_by TEXT,
+        referral_count INTEGER DEFAULT 0,
+        created_at INTEGER
+      )
+    `).run();
+
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS admin_batch (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_id TEXT,
+        message_id INTEGER NOT NULL
+      )
+    `).run();
+
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS batches (
         token TEXT PRIMARY KEY,
@@ -1168,6 +1311,16 @@ async function ensureSchema(env) {
         msg_ids TEXT NOT NULL,
         created_by TEXT,
         created_at INTEGER
+      )
+    `).run();
+
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS deletions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        delete_at INTEGER NOT NULL,
+        reminded INTEGER DEFAULT 0
       )
     `).run();
 
@@ -1195,7 +1348,7 @@ async function ensureSchema(env) {
       )
     `).run();
 
-    // Auto-add new columns to existing users & deletions tables if missing
+    // Migrations for pre-existing tables created under old schema
     const migrations = [
       "ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'si'",
       "ALTER TABLE users ADD COLUMN username TEXT",
@@ -1205,6 +1358,7 @@ async function ensureSchema(env) {
       "ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0",
       "ALTER TABLE users ADD COLUMN referred_by TEXT",
       "ALTER TABLE users ADD COLUMN created_at INTEGER",
+      "ALTER TABLE admin_batch ADD COLUMN admin_id TEXT",
       "ALTER TABLE deletions ADD COLUMN reminded INTEGER DEFAULT 0",
     ];
 
@@ -1215,6 +1369,8 @@ async function ensureSchema(env) {
         // Ignored if column already exists
       }
     }
+
+    isSchemaMigrated = true;
   } catch (err) {
     console.error("Schema ensure error:", err);
   }
