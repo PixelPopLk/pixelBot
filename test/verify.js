@@ -58,4 +58,36 @@ function escapeHtml(text) {
 assert.strictEqual(escapeHtml("Deadpool & Wolverine <2024>"), "Deadpool &amp; Wolverine &lt;2024&gt;");
 console.log("✅ Test 5 Passed: HTML Sanitizer prevents tag injection");
 
-console.log("\n🎉 All 5 Verification Tests Passed Successfully!");
+// 6. VIP Plan Duration Calculations
+function getVipDurationMs(plan) {
+  if (plan === "weekly") return 7 * 24 * 60 * 60 * 1000;
+  if (plan === "monthly") return 30 * 24 * 60 * 60 * 1000;
+  if (plan === "lifetime") return 100 * 365 * 24 * 60 * 60 * 1000;
+  return 30 * 24 * 60 * 60 * 1000;
+}
+assert.strictEqual(getVipDurationMs("weekly"), 604800000);
+assert.strictEqual(getVipDurationMs("monthly"), 2592000000);
+assert.strictEqual(getVipDurationMs("lifetime") > 3000000000000, true);
+console.log("✅ Test 6 Passed: Flexible VIP duration calculation verified (Weekly, Monthly, Lifetime)");
+
+// 7. TMDb Query Cleaner Test
+function cleanTmdbQuery(query) {
+  return query
+    .replace(/[\[\(].*?[\]\)]/g, "")
+    .replace(/\b(1080p|720p|480p|4k|hdr|bluray|web-dl|hdrip|x264|x265|hevc|season\s*\d+|s\d+e\d+|episode\s*\d+)\b/gi, "")
+    .trim();
+}
+assert.strictEqual(cleanTmdbQuery("Avatar The Way of Water [1080p] (2022) Bluray x264"), "Avatar The Way of Water");
+assert.strictEqual(cleanTmdbQuery("Stranger Things Season 4 S04E01 720p HEVC"), "Stranger Things");
+console.log("✅ Test 7 Passed: TMDb title cleaner strips release tags accurately");
+
+// 8. Request Command Extraction
+function parseRequestQuery(text) {
+  return text.replace(/^\/(request|req)\s*/i, "").trim();
+}
+assert.strictEqual(parseRequestQuery("/request Interstellar 2014"), "Interstellar 2014");
+assert.strictEqual(parseRequestQuery("/req Dune Part Two"), "Dune Part Two");
+console.log("✅ Test 8 Passed: Movie Request command query extraction verified");
+
+console.log("\n🎉 All 8 Verification Tests Passed Successfully!");
+

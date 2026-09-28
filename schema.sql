@@ -25,6 +25,7 @@ CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by);
 CREATE TABLE IF NOT EXISTS batches (
     token TEXT PRIMARY KEY,     -- Unique secure token (e.g. b_a7f92b4c)
     title TEXT,                 -- Movie / Series Title (Optional)
+    poster_url TEXT,            -- TMDb Poster Image URL (Optional)
     msg_ids TEXT NOT NULL,      -- JSON array of Storage Channel message IDs
     created_by TEXT,            -- Admin user ID
     created_at INTEGER
@@ -71,8 +72,22 @@ CREATE TABLE IF NOT EXISTS vip_requests (
     user_id TEXT NOT NULL,
     user_name TEXT,
     file_id TEXT NOT NULL,      -- Telegram photo file_id of bank slip
+    plan TEXT DEFAULT 'monthly', -- 'weekly', 'monthly', 'lifetime'
     status TEXT DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
     created_at INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_vip_requests_status ON vip_requests(status);
+
+-- 7. Movie & TV Series Requests Table
+CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    user_name TEXT,
+    query TEXT NOT NULL,
+    status TEXT DEFAULT 'pending', -- 'pending', 'fulfilled', 'rejected'
+    created_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
+

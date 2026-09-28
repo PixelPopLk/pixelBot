@@ -85,13 +85,37 @@ export default {
       );
     }
 
-    // 2. AD CLICK RECORD (User Ad එකට ගිය වෙලාව D1 Database එකේ සටහන් කිරීම)
-    if (url.pathname === "/ad_started" || url.pathname === "/verify") {
-      const userId = url.searchParams.get("a");
+    // 2. AD CLICK & VERIFICATION RECORD (Secret Token-based Anti-Bypass System)
+    if (url.pathname === "/verify" || url.pathname === "/verify_ad" || url.pathname === "/ad_started") {
+      const userId = url.searchParams.get("u") || url.searchParams.get("a");
+      const token = url.searchParams.get("t");
+
       if (userId && env.DB) {
-        await env.DB.prepare(`
-          UPDATE users SET ad_started_at = ? WHERE user_id = ?
-        `).bind(Date.now(), userId.toString()).run();
+        if (token) {
+          // Cryptographic token verification from verify.html
+          const user = await env.DB.prepare(`SELECT verify_token FROM users WHERE user_id = ?`).bind(userId.toString()).first();
+          if (user && user.verify_token === token) {
+            await env.DB.prepare(`
+              UPDATE users SET ad_verified = 1, ad_started_at = ? WHERE user_id = ?
+            `).bind(Date.now(), userId.toString()).run();
+            return new Response(JSON.stringify({ ok: true, status: "verified" }), {
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            });
+          } else {
+            return new Response(JSON.stringify({ ok: false, error: "Invalid or expired verification token" }), {
+              status: 400,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            });
+          }
+        } else {
+          // Fallback legacy ad_started without token
+          await env.DB.prepare(`
+            UPDATE users SET ad_started_at = ? WHERE user_id = ?
+          `).bind(Date.now(), userId.toString()).run();
+          return new Response(JSON.stringify({ ok: true, note: "legacy_ping_received" }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
       }
       return new Response("OK", { headers: corsHeaders });
     }
@@ -164,7 +188,8 @@ async function handleMessage(msg, env) {
   // 👑 2. ADMIN-ONLY COMMANDS & FILE INGESTION
   if (isAdmin) {
     // A. Admin File Uploads (Videos, Documents, Photos, Audios, Forwards)
-    if (!text.startsWith("/")) {
+    const hasMedia = msg.video || msg.document || msg.audio || msg.animation || msg.forward_origin || msg.forward_from_chat;
+    if (hasMedia) {
       await handleAdminFileUpload(msg, env);
       return;
     }
@@ -267,16 +292,49 @@ async function handleMessage(msg, env) {
 
   // D. Help Command
   if (text.startsWith("/help")) {
+    const backupBot = env.BACKUP_BOT_USERNAME || "PixelPopStorebot";
     const lang = await getUserLang(env, chatId);
     const helpMsg = lang === "si"
-      ? `📖 <b>PixelPop Bot භාවිතා කරන්නේ කෙසේද?</b>\n━━━━━━━━━━━━━━━━━━━━\n1️⃣ Channel එකේ ඇති Movie / Series Link එකක් Click කරන්න.\n2️⃣ Main Channel එකට Join වී සිටින්න.\n3️⃣ <b>නොමිලේ ලබා ගැනීමට:</b> '🎬 Watch Ads' ඔබා තත්පර 5ක් නරඹා 'I have clicked ads ⁉️' ඔබන්න.\n4️⃣ <b>Instant Download:</b> කිසිදු Ad එකක් නැතිව ⭐️ 5 Stars මගින් ක්ෂණිකව ලබාගත හැක.\n\n👑 <b>VIP සාමාජිකත්වය:</b> කිසිදු Ad එකක් නැතිව සහ Files පැය 6කින් මැකී නොයන VIP වීමට /vip භාවිතා කරන්න.`
-      : `📖 <b>How to Use PixelPop Bot:</b>\n━━━━━━━━━━━━━━━━━━━━\n1️⃣ Click any Movie/Series link from our channel.\n2️⃣ Ensure you have joined our official channel.\n3️⃣ <b>Free Download:</b> Tap '🎬 Watch Ads', stay 5s, and tap 'I have clicked ads ⁉️'.\n4️⃣ <b>Instant Download:</b> Skip ads instantly with ⭐️ 5 Telegram Stars!\n\n👑 <b>VIP Membership:</b> Get lifetime/30-day ad-free access with permanent file storage via /vip.`;
+      ? `📖 <b>PixelPop Bot භාවිතා කරන්නේ කෙසේද?</b>\n━━━━━━━━━━━━━━━━━━━━\n1️⃣ <b>Live Search:</b> ඕනෑම චිත්‍රපටයක නම මෙහි Type කරන්න (උදා: Avatar, Inception).\n2️⃣ <b>Download Links:</b> Channel එකේ ඇති Download Links මගින්ද ලබාගත හැක.\n3️⃣ <b>නොමිලේ ලබා ගැනීමට:</b> '🎬 Watch Ad' ඔබා තත්පර 5ක් නරඹා 'I have watched ad ⁉️' ඔබන්න.\n4️⃣ <b>Instant Download:</b> Ads නැතිව ⭐️ 5 Stars මගින් ක්ෂණිකව ලබාගත හැක.\n\n🎬 <b>චිත්‍රපට ඉල්ලීමට:</b> /request Movie Name\n👑 <b>VIP සාමාජිකත්වය:</b> /vip\n🛡️ <b>Backup Bot:</b> /backup`
+      : `📖 <b>How to Use PixelPop Bot:</b>\n━━━━━━━━━━━━━━━━━━━━\n1️⃣ <b>Live Search:</b> Just type any movie/series name here (e.g., Inception, Avatar).\n2️⃣ <b>Download Links:</b> Tap links posted in our official channel.\n3️⃣ <b>Free Access:</b> Tap '🎬 Watch Ad', wait 5s, and verify.\n4️⃣ <b>Instant Access:</b> Skip ads instantly with ⭐️ 5 Stars!\n\n🎬 <b>Request Movies:</b> /request Movie Name\n👑 <b>VIP Membership:</b> /vip\n🛡️ <b>Backup Bot:</b> /backup`;
 
     await sendReply(env, chatId, helpMsg);
     return;
   }
 
-  // E. /start Command (Deep Link & Referral handling)
+  // E. /backup Command
+  if (text.startsWith("/backup")) {
+    const backupBot = env.BACKUP_BOT_USERNAME || "PixelPopStorebot";
+    const backupLink = env.BACKUP_CHANNEL_LINK || env.FORCE_SUB_CHANNEL_LINK || "https://t.me/pixel_pop_lk";
+    const backupMsg = `🛡️ <b>PixelPop Official Backup System:</b>\n━━━━━━━━━━━━━━━━━━━━\nප්‍රධාන Bot ට යම් කාර්මික දෝෂයක් හෝ Telegram සීමාවක් ආවොත්, සේවාව අඛණ්ඩව ලබා ගැනීමට Backup Bot හා Channel එක save කර තබාගන්න!\n\n🤖 <b>Backup Bot:</b> @${backupBot}\n🔗 <b>Direct Link:</b> https://t.me/${backupBot}\n📢 <b>Backup Channel:</b> ${backupLink}\n━━━━━━━━━━━━━━━━━━━━\n<i>දෙකෙහිම එකම Movies & Series Database එක ක්‍රියාත්මක වේ.</i>`;
+    await sendReply(env, chatId, backupMsg);
+    return;
+  }
+
+  // F. /request Command (Movie & Series Requests)
+  if (text.startsWith("/request") || text.startsWith("/req")) {
+    const query = text.replace(/^\/(request|req)\s*/i, "").trim();
+    if (!query) {
+      await sendReply(
+        env,
+        chatId,
+        `🎬 <b>PixelPop Request Desk:</b>\n━━━━━━━━━━━━━━━━━━━━\nඔබට අවශ්‍ය ඕනෑම Movie හෝ TV Series එකක් අපෙන් ඉල්ලීමට:\n<code>/request Movie Name</code> ලෙස Type කර එවන්න.\n\nඋදාහරණ: <code>/request Spider-Man No Way Home</code>`
+      );
+      return;
+    }
+    const userName = msg.from.username ? `@${msg.from.username}` : (msg.from.first_name || "User");
+    await handleMovieRequest(env, chatId, userName, query);
+    return;
+  }
+
+  // G. /search Command (Explicit Search)
+  if (text.startsWith("/search ")) {
+    const query = text.replace("/search ", "").trim();
+    await handleLiveSearch(env, chatId, query);
+    return;
+  }
+
+  // H. /start Command (Deep Link & Referral handling)
   if (text.startsWith("/start")) {
     const parts = text.split(" ");
 
@@ -300,13 +358,21 @@ async function handleMessage(msg, env) {
       // Valid subscriber -> Initiate File Preview / Session
       await initiateFileSession(env, chatId, payload);
     } else {
+      const backupBot = env.BACKUP_BOT_USERNAME || "PixelPopStorebot";
       const lang = await getUserLang(env, chatId);
       const welcomeText = lang === "si"
-        ? `👋 <b>PixelPop File Store වෙත සාදරයෙන් පිළිගනිමු!</b>\n\nMovies සහ TV Series බාගත කර ගැනීමට කරුණාකර අපගේ Channel එකේ ඇති Links භාවිතා කරන්න.\n\n👑 <b>VIP සාමාජිකත්වය:</b> /vip\n👥 <b>නොමිලේ VIP ලබාගන්න:</b> /referral\n🌐 <b>භාෂාව වෙනස් කිරීමට:</b> /language`
-        : `👋 <b>Welcome to PixelPop File Store!</b>\n\nPlease use the download links posted on our official channel to access movies and series.\n\n👑 <b>VIP Membership:</b> /vip\n👥 <b>Free VIP Pass:</b> /referral\n🌐 <b>Language:</b> /language`;
+        ? `👋 <b>PixelPop File Store වෙත සාදරයෙන් පිළිගනිමු!</b>\n━━━━━━━━━━━━━━━━━━━━\n🔍 <b>Live Search:</b> ඕනෑම චිත්‍රපටයක නම මෙහි Type කර Poster එක හා Links ලබාගන්න!\n\n👑 <b>VIP සාමාජිකත්වය:</b> /vip\n🎬 <b>චිත්‍රපට ඉල්ලීමට:</b> /request\n👥 <b>නොමිලේ VIP ලබාගන්න:</b> /referral\n🛡️ <b>Backup Bot:</b> @${backupBot}\n🌐 <b>භාෂාව වෙනස් කිරීමට:</b> /language`
+        : `👋 <b>Welcome to PixelPop File Store!</b>\n━━━━━━━━━━━━━━━━━━━━\n🔍 <b>Live Search:</b> Simply type any Movie / Series name here to search!\n\n👑 <b>VIP Membership:</b> /vip\n🎬 <b>Request Movies:</b> /request\n👥 <b>Free VIP Pass:</b> /referral\n🛡️ <b>Backup Bot:</b> @${backupBot}\n🌐 <b>Language:</b> /language`;
 
       await sendReply(env, chatId, welcomeText);
     }
+    return;
+  }
+
+  // 🔍 5. IN-BOT LIVE SEARCH (PLAIN TEXT - NO COMMAND NEEDED)
+  if (!text.startsWith("/") && text.length >= 2) {
+    await handleLiveSearch(env, chatId, text);
+    return;
   }
 }
 
@@ -467,42 +533,158 @@ async function handleCallbackQuery(cb, env) {
     return;
   }
 
-  // 5. 30-Day VIP Purchase via Stars (60 Stars)
+  // 5. VIP Stars Menu & Purchases
+  if (data === "vip_stars_menu") {
+    const starsKb = {
+      inline_keyboard: [
+        [{ text: "🗓️ Weekly Pass - ⭐️ 20 Stars (7 Days)", callback_data: "buy_vip_stars_weekly" }],
+        [{ text: "🗓️ Monthly Pass - ⭐️ 60 Stars (30 Days)", callback_data: "buy_vip_stars_30d" }],
+        [{ text: "👑 Lifetime VIP - ⭐️ 500 Stars (Forever)", callback_data: "buy_vip_stars_lifetime" }],
+        [{ text: "🔙 Back / ආපසු", callback_data: "vip_back" }],
+      ],
+    };
+    await callTelegram(env.BOT_TOKEN, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text: "⭐️ <b>Telegram Stars VIP Packages:</b>\n━━━━━━━━━━━━━━━━━━━━\nTelegram Stars මගින් ගෙවූ සැනින් VIP සක්‍රීය වේ (Automatic Instant Activation):\n\n• 🗓️ <b>Weekly:</b> ⭐️ 20 Stars (දින 7)\n• 🗓️ <b>Monthly:</b> ⭐️ 60 Stars (දින 30)\n• 👑 <b>Lifetime:</b> ⭐️ 500 Stars (සදාකාලික)\n━━━━━━━━━━━━━━━━━━━━",
+      reply_markup: starsKb,
+    });
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
+    return;
+  }
+
+  if (data === "vip_back") {
+    await sendVipInfoCard(env, chatId);
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
+    return;
+  }
+
+  if (data === "buy_vip_stars_weekly") {
+    await sendStarsInvoice(env, chatId, {
+      title: "🗓️ Weekly VIP Pass (7 Days)",
+      description: "Ad-free unlimited downloads + permanent files for 7 days!",
+      payload: "vip_stars_7d",
+      starsAmount: 20,
+    });
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
+    return;
+  }
+
   if (data === "buy_vip_stars_30d") {
     await sendStarsInvoice(env, chatId, {
       title: "👑 30-Day VIP Pass",
       description: "Unlimited ad-free downloads + permanent files for 30 days!",
       payload: "vip_30d",
-      starsAmount: 60, // ⭐️ 60 Stars for 30 days VIP
+      starsAmount: 60,
     });
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
     return;
   }
 
-  // 6. VIP BOC Bank Slip Request Initiation
+  if (data === "buy_vip_stars_lifetime") {
+    await sendStarsInvoice(env, chatId, {
+      title: "👑 Lifetime VIP Pass",
+      description: "Permanent ad-free access with zero auto-deletion forever!",
+      payload: "vip_stars_lifetime",
+      starsAmount: 500,
+    });
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
+    return;
+  }
+
+  // 6. VIP BOC Bank Plan Selections
+  if (data === "vip_plan_weekly") {
+    await sendBankPaymentInstructions(env, chatId, "weekly");
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
+    return;
+  }
+
+  if (data === "vip_plan_monthly") {
+    await sendBankPaymentInstructions(env, chatId, "monthly");
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
+    return;
+  }
+
+  if (data === "vip_plan_lifetime") {
+    await sendBankPaymentInstructions(env, chatId, "lifetime");
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
+    return;
+  }
+
   if (data === "vip_pay_bank") {
-    await sendBankPaymentInstructions(env, chatId);
+    await sendBankPaymentInstructions(env, chatId, "all");
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
     return;
   }
 
   // 7. Admin VIP Approval / Rejection
+  if (data.startsWith("vip_approve_weekly_") && chatId === env.ADMIN_ID?.toString()) {
+    const reqId = data.replace("vip_approve_weekly_", "");
+    await handleAdminVipApproval(env, chatId, reqId, "weekly");
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ Weekly VIP Approved!" });
+    return;
+  }
+
+  if (data.startsWith("vip_approve_monthly_") && chatId === env.ADMIN_ID?.toString()) {
+    const reqId = data.replace("vip_approve_monthly_", "");
+    await handleAdminVipApproval(env, chatId, reqId, "monthly");
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ Monthly VIP Approved!" });
+    return;
+  }
+
+  if (data.startsWith("vip_approve_lifetime_") && chatId === env.ADMIN_ID?.toString()) {
+    const reqId = data.replace("vip_approve_lifetime_", "");
+    await handleAdminVipApproval(env, chatId, reqId, "lifetime");
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "👑 Lifetime VIP Approved!" });
+    return;
+  }
+
   if (data.startsWith("vip_approve_") && chatId === env.ADMIN_ID?.toString()) {
     const reqId = data.replace("vip_approve_", "");
-    await handleAdminVipApproval(env, chatId, reqId, true);
-    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
-      callback_query_id: cb.id,
-      text: "✅ VIP Approved!",
-    });
+    await handleAdminVipApproval(env, chatId, reqId, "monthly");
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ VIP Approved!" });
     return;
   }
 
   if (data.startsWith("vip_reject_") && chatId === env.ADMIN_ID?.toString()) {
     const reqId = data.replace("vip_reject_", "");
-    await handleAdminVipApproval(env, chatId, reqId, false);
+    await handleAdminVipApproval(env, chatId, reqId, "reject");
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "❌ VIP Rejected." });
+    return;
+  }
+
+  // 8. Movie Request Admin Actions & User Button Request
+  if (data.startsWith("req_fulfill_") && chatId === env.ADMIN_ID?.toString()) {
+    const reqId = data.replace("req_fulfill_", "");
+    const req = await env.DB.prepare(`SELECT * FROM requests WHERE id = ?`).bind(reqId).first();
+    if (req) {
+      await env.DB.prepare(`UPDATE requests SET status = 'fulfilled' WHERE id = ?`).bind(reqId).run();
+      await sendReply(
+        env,
+        req.user_id,
+        `🎉 <b>Good News! ඔබ ඉල්ලූ Movie/Series එක දැන් Ready!</b>\n━━━━━━━━━━━━━━━━━━━━\n🎬 <b>${escapeHtml(req.query)}</b> දැන් PixelPop වෙත එක් කර ඇත!\nදැන්ම නම Search කර හෝ අපගේ Channel එකෙන් ලබාගන්න.`
+      );
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ User notified!" });
+      await sendReply(env, chatId, `✅ Marked Request #${reqId} (${req.query}) as Fulfilled & User Notified.`);
+    }
+    return;
+  }
+
+  if (data.startsWith("req_decline_") && chatId === env.ADMIN_ID?.toString()) {
+    const reqId = data.replace("req_decline_", "");
+    await env.DB.prepare(`UPDATE requests SET status = 'rejected' WHERE id = ?`).bind(reqId).run();
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "❌ Request declined." });
+    await sendReply(env, chatId, `❌ Request #${reqId} declined.`);
+    return;
+  }
+
+  if (data.startsWith("req_movie_")) {
+    const movieTitle = data.replace("req_movie_", "");
+    const userName = cb.from.username ? `@${cb.from.username}` : (cb.from.first_name || "User");
+    await handleMovieRequest(env, chatId, userName, movieTitle);
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: cb.id,
-      text: "❌ VIP Rejected.",
+      text: "✅ Request submitted to Admin!",
     });
     return;
   }
@@ -510,6 +692,34 @@ async function handleCallbackQuery(cb, env) {
   // 8. "I have clicked ads" Button Verification
   if (data === "check_ad") {
     await handleAdVerification(env, chatId, cb);
+    return;
+  }
+
+  // 9. Cooldown Refresh Button
+  if (data.startsWith("refresh_cooldown_")) {
+    const payload = data.replace("refresh_cooldown_", "");
+    const user = await env.DB.prepare(`SELECT * FROM users WHERE user_id = ?`).bind(chatId).first();
+    const COOLDOWN_MS = 5 * 60 * 1000;
+    const lastDownload = user?.last_download_at || 0;
+    const timePassed = Date.now() - lastDownload;
+
+    if (lastDownload > 0 && timePassed < COOLDOWN_MS && !isUserVipActive(user)) {
+      const remainingMs = COOLDOWN_MS - timePassed;
+      const remainingMins = Math.floor(remainingMs / 60000);
+      const remainingSecs = Math.ceil((remainingMs % 60000) / 1000);
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+        callback_query_id: cb.id,
+        text: `⏳ Cooldown active: ${remainingMins}m ${remainingSecs}s remaining!`,
+        show_alert: true,
+      });
+    } else {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+        callback_query_id: cb.id,
+        text: "✅ Cooldown finished! Ready to download.",
+        show_alert: false,
+      });
+      await initiateFileSession(env, chatId, payload);
+    }
     return;
   }
 }
@@ -538,18 +748,19 @@ async function handleAdVerification(env, chatId, cb) {
     return;
   }
 
-  // Check if ad was opened
-  if (!user.ad_started_at) {
+  // 1. Check if ad was verified with secret token or opened
+  if (user.ad_verified !== 1 && !user.ad_started_at) {
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: cb.id,
-      text: "❌ You haven't clicked the ad button yet!\nඔබ තවමත් 'Watch Ads (for 5s)' Button එක ඔබා නැත!",
+      text: "❌ You haven't completed the sponsor ad on the website yet!\nඔබ තවමත් Sponsor Ad එක සම්පූර්ණ කර නැත!",
       show_alert: true,
     });
     return;
   }
 
-  // 5-second verification
-  const timePassedSeconds = (Date.now() - user.ad_started_at) / 1000;
+  // 2. 5-second anti-cheat verification
+  const startTime = user.ad_started_at || 0;
+  const timePassedSeconds = (Date.now() - startTime) / 1000;
   if (timePassedSeconds < 5) {
     const remaining = Math.ceil(5 - timePassedSeconds);
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
@@ -588,6 +799,7 @@ async function initiateFileSession(env, chatId, payload) {
   try {
     let targetMsgIds = [];
     let movieTitle = null;
+    let posterUrl = null;
 
     // A. Check modern secure UUID batch token (b_xxxxxxxx)
     if (payload.startsWith("b_")) {
@@ -600,6 +812,7 @@ async function initiateFileSession(env, chatId, payload) {
       }
       targetMsgIds = JSON.parse(batch.msg_ids);
       movieTitle = batch.title;
+      posterUrl = batch.poster_url || null;
     } else {
       // B. Backward compatibility for legacy Base64 links
       const rawCode = atob(payload);
@@ -617,17 +830,21 @@ async function initiateFileSession(env, chatId, payload) {
       }
     }
 
-    // Save target session in D1
+    // Save target session in D1 + generate fresh secret verification token
+    const verifyToken = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+
     await env.DB.prepare(`
-      INSERT INTO users (user_id, msg_ids, ad_started_at, delivered)
-      VALUES (?, ?, NULL, 0)
+      INSERT INTO users (user_id, msg_ids, ad_started_at, delivered, ad_verified, verify_token)
+      VALUES (?, ?, NULL, 0, 0, ?)
       ON CONFLICT(user_id) DO UPDATE SET
         msg_ids = excluded.msg_ids,
         ad_started_at = NULL,
-        delivered = 0
-    `).bind(chatId, JSON.stringify(targetMsgIds)).run();
+        delivered = 0,
+        ad_verified = 0,
+        verify_token = excluded.verify_token
+    `).bind(chatId, JSON.stringify(targetMsgIds), verifyToken).run();
 
-    // Check if user has active VIP
+    // Check if user has active VIP (no cooldown, no ads)
     const user = await env.DB.prepare(`SELECT * FROM users WHERE user_id = ?`).bind(chatId).first();
     if (isUserVipActive(user)) {
       await sendReply(
@@ -639,9 +856,37 @@ async function initiateFileSession(env, chatId, payload) {
       return;
     }
 
-    // Display Rich Preview & Choice Card
+    // 🕐 COOLDOWN CHECK for Free Users (5 minutes between downloads)
+    const COOLDOWN_MS = 5 * 60 * 1000;
+    const lastDownload = user?.last_download_at || 0;
+    const timePassed = Date.now() - lastDownload;
+
+    if (lastDownload > 0 && timePassed < COOLDOWN_MS) {
+      const remainingMs = COOLDOWN_MS - timePassed;
+      const remainingMins = Math.floor(remainingMs / 60000);
+      const remainingSecs = Math.ceil((remainingMs % 60000) / 1000);
+
+      const cooldownKeyboard = {
+        inline_keyboard: [
+          [{ text: `⏳ Wait ${remainingMins}m ${remainingSecs}s (Free Limit)`, callback_data: `refresh_cooldown_${payload}` }],
+          [{ text: "⚡ Skip Cooldown with 5 Stars (Instant)", callback_data: `buy_fast_pass_${payload}` }],
+          [{ text: "👑 Get VIP (No Limits, Forever)", callback_data: "vip_pay_bank" }],
+        ],
+      };
+
+      const titleDisplay = movieTitle ? `🎬 <b>${escapeHtml(movieTitle)}</b>\n` : "";
+      await callTelegram(env.BOT_TOKEN, "sendMessage", {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text: `⏳ <b>Free Download Cooldown Active!</b>\n━━━━━━━━━━━━━━━━━━━━\n${titleDisplay}ඔබ මීට සුළු මොහොතකට පෙර Download එකක් ලබාගත්තා.\n\n⏰ <b>Cooldown:</b> තවත් <b>${remainingMins} minutes ${remainingSecs} seconds</b> රැඳී සිටින්න.\n\n💡 <b>ඉක්මනින් ගන්නද?</b>\n⚡ ⭐️ 5 Stars ගෙවා Cooldown Skip කරන්න.\n👑 VIP ලබාගෙන Unlimited Downloads!\n━━━━━━━━━━━━━━━━━━━━`,
+        reply_markup: cooldownKeyboard,
+      });
+      return;
+    }
+
+    // Display Rich Preview & Choice Card with Secret Token embedded in verify URL
     const websiteUrl = env.WEBSITE_URL || "https://pixelpoplk.pages.dev";
-    const adUrl = `${websiteUrl}/verify.html?a=${chatId}`;
+    const adUrl = `${websiteUrl}/verify.html?u=${chatId}&t=${verifyToken}`;
 
     const titleDisplay = movieTitle ? `🎬 <b>${escapeHtml(movieTitle)}</b>\n` : "";
     const fileCount = targetMsgIds.length;
@@ -651,18 +896,32 @@ async function initiateFileSession(env, chatId, payload) {
         [{ text: "🎬 Watch Ad (Free / නොමිලේ)", url: adUrl }],
         [{ text: "✅ I have watched ad ⁉️ / බැලුවා", callback_data: "check_ad" }],
         [{ text: "⚡ Skip Ad with 5 Stars (Instant)", callback_data: `buy_fast_pass_${payload}` }],
-        [{ text: "👑 Get VIP (30 Days Unlimited)", callback_data: "vip_pay_bank" }],
+        [{ text: "👑 Get VIP (Weekly / Monthly / Lifetime)", callback_data: "vip_pay_bank" }],
       ],
     };
 
     const previewMsg = `🍿 <b>PixelPop File Ready for Download:</b>\n━━━━━━━━━━━━━━━━━━━━\n${titleDisplay}📁 <b>Total Files:</b> ${fileCount} File(s)\n⚡ <b>Instant Access:</b> Pay 5 Stars to download without ads.\n🆓 <b>Free Access:</b> Click 'Watch Ad', stay 5s, and tap 'I have watched ad'.\n━━━━━━━━━━━━━━━━━━━━`;
 
-    await callTelegram(env.BOT_TOKEN, "sendMessage", {
-      chat_id: chatId,
-      parse_mode: "HTML",
-      text: previewMsg,
-      reply_markup: keyboard,
-    });
+    let sentPhoto = false;
+    if (posterUrl && previewMsg.length <= 950) {
+      const pRes = await callTelegram(env.BOT_TOKEN, "sendPhoto", {
+        chat_id: chatId,
+        photo: posterUrl,
+        caption: previewMsg,
+        parse_mode: "HTML",
+        reply_markup: keyboard,
+      });
+      sentPhoto = pRes.ok;
+    }
+
+    if (!sentPhoto) {
+      await callTelegram(env.BOT_TOKEN, "sendMessage", {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text: previewMsg,
+        reply_markup: keyboard,
+      });
+    }
   } catch (err) {
     await sendReply(env, chatId, "❌ <b>Invalid or Expired Link!</b>\nකරුණාකර Channel එකේ ඇති අලුත්ම Download Link එක භාවිතා කරන්න.");
   }
@@ -717,6 +976,11 @@ async function sendBatchFiles(env, chatId, msgIds, isVip = false) {
       INSERT INTO deletions (chat_id, message_id, delete_at, reminded) VALUES (?, ?, ?, 0)
     `).bind(chatId, sentId, deleteAt).run();
   }
+
+  // ⏱️ Record download timestamp to enforce 5-min cooldown on next request
+  await env.DB.prepare(`UPDATE users SET last_download_at = ? WHERE user_id = ?`)
+    .bind(Date.now(), chatId)
+    .run();
 
   return results;
 }
@@ -843,18 +1107,32 @@ async function handleSuccessfulPayment(msg, env) {
       "⚡ <b>Fast Pass Activated!</b>\nThank you for paying with Stars. Delivering your files immediately..."
     );
     await initiateFileSession(env, chatId, batchPayload);
-  } else if (payload === "vip_30d") {
-    const thirtyDays = 30 * 24 * 60 * 60 * 1000;
-    const expiresAt = Date.now() + thirtyDays;
-
-    await env.DB.prepare(`
-      UPDATE users SET is_vip = 1, vip_until = ? WHERE user_id = ?
-    `).bind(expiresAt, chatId).run();
-
+  } else if (payload === "vip_stars_7d") {
+    const sevenDays = 7 * 24 * 60 * 60 * 1000;
+    const expiresAt = Date.now() + sevenDays;
+    await env.DB.prepare(`UPDATE users SET is_vip = 1, vip_until = ? WHERE user_id = ?`).bind(expiresAt, chatId).run();
     await sendReply(
       env,
       chatId,
-      `🎉 <b>30-Day VIP Pass Activated!</b>\n━━━━━━━━━━━━━━━━━━━━\nThank you! You now have unlimited instant downloads without ads, and your files will never be auto-deleted.`
+      `🎉 <b>Weekly VIP Pass (7 Days) Activated!</b>\n━━━━━━━━━━━━━━━━━━━━\nThank you for paying with Stars! You now have unlimited instant downloads without ads for 7 days. Your files will never be auto-deleted.`
+    );
+  } else if (payload === "vip_30d" || payload === "vip_stars_30d") {
+    const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+    const expiresAt = Date.now() + thirtyDays;
+    await env.DB.prepare(`UPDATE users SET is_vip = 1, vip_until = ? WHERE user_id = ?`).bind(expiresAt, chatId).run();
+    await sendReply(
+      env,
+      chatId,
+      `🎉 <b>30-Day VIP Pass Activated!</b>\n━━━━━━━━━━━━━━━━━━━━\nThank you for paying with Stars! You now have unlimited instant downloads without ads, and your files will never be auto-deleted.`
+    );
+  } else if (payload === "vip_stars_lifetime") {
+    const hundredYears = 100 * 365 * 24 * 60 * 60 * 1000;
+    const expiresAt = Date.now() + hundredYears;
+    await env.DB.prepare(`UPDATE users SET is_vip = 1, vip_until = ? WHERE user_id = ?`).bind(expiresAt, chatId).run();
+    await sendReply(
+      env,
+      chatId,
+      `👑 <b>LIFETIME VIP Pass Activated!</b>\n━━━━━━━━━━━━━━━━━━━━\nThank you! You now have lifetime unlimited instant downloads without ads. Your files will NEVER be auto-deleted!`
     );
   }
 }
@@ -863,12 +1141,17 @@ async function handleSuccessfulPayment(msg, env) {
 async function sendVipInfoCard(env, chatId) {
   const keyboard = {
     inline_keyboard: [
-      [{ text: "⭐️ Buy with 60 Stars (Instant)", callback_data: "buy_vip_stars_30d" }],
-      [{ text: "🏛️ Bank of Ceylon (BOC) - LKR 350", callback_data: "vip_pay_bank" }],
+      [
+        { text: "🗓️ Weekly (Rs. 100)", callback_data: "vip_plan_weekly" },
+        { text: "🗓️ Monthly (Rs. 300)", callback_data: "vip_plan_monthly" },
+      ],
+      [{ text: "👑 Lifetime VIP Pass (Rs. 2500)", callback_data: "vip_plan_lifetime" }],
+      [{ text: "⭐️ Pay with Telegram Stars (XTR)", callback_data: "vip_stars_menu" }],
+      [{ text: "🏛️ Bank of Ceylon (BOC Details)", callback_data: "vip_pay_bank" }],
     ],
   };
 
-  const text = `👑 <b>PixelPop VIP Membership Club</b>\n━━━━━━━━━━━━━━━━━━━━\n🌟 <b>VIP වාසි:</b>\n• කිසිදු Ad එකක් නැත (100% Ad-Free)\n• Files පැය 6කින් මැකී යන්නේ නැත (Permanent Access)\n• One-click Season Packs Instant Downloads\n\n💰 <b>මිල ගණන්:</b>\n• 30 Days VIP: <b>LKR 350/=</b> හෝ <b>⭐️ 60 Stars</b>\n━━━━━━━━━━━━━━━━━━━━\nපහතින් ඔබට පහසු ගෙවීම් ක්‍රමය තෝරන්න:`;
+  const text = `👑 <b>PixelPop VIP Membership Club</b>\n━━━━━━━━━━━━━━━━━━━━\n🌟 <b>VIP විශේෂ වරප්‍රසාද:</b>\n• 🚫 <b>Zero Ads:</b> කිසිදු Sponsor Ad එකක් නැත\n• ⏳ <b>No Cooldown:</b> ලිමිට් නැතිව එක දිගට Downloads\n• 🛡️ <b>Permanent:</b> Files පැය 6කින් මැකී යන්නේ නැත\n• ⚡ <b>Complete Seasons:</b> 1-Click Instant Downloads\n\n💎 <b>පැකේජ මිල ගණන් (Flexible VIP Plans):</b>\n• 🗓️ <b>Weekly Pass (දින 7):</b> LKR 100/= (හෝ ⭐️ 20 Stars)\n• 🗓️ <b>Monthly Pass (දින 30):</b> LKR 300/= (හෝ ⭐️ 60 Stars)\n• 👑 <b>Lifetime VIP (සදාකාලික):</b> LKR 2500/= (හෝ ⭐️ 500 Stars)\n━━━━━━━━━━━━━━━━━━━━\nගෙවීම් සිදු කිරීමට පහත Button එකක් තෝරන්න:`;
 
   await callTelegram(env.BOT_TOKEN, "sendMessage", {
     chat_id: chatId,
@@ -878,11 +1161,22 @@ async function sendVipInfoCard(env, chatId) {
   });
 }
 
-async function sendBankPaymentInstructions(env, chatId) {
+async function sendBankPaymentInstructions(env, chatId, plan = "all") {
   const bocAcc = env.BOC_ACCOUNT_NUMBER || "1234567890";
   const bocName = env.BOC_ACCOUNT_NAME || "R.M.P. Madusanka";
 
-  const bankMsg = `🏛️ <b>Bank of Ceylon (BOC) Payment Details:</b>\n━━━━━━━━━━━━━━━━━━━━\nගාස්තුව: <b>LKR 350/= (දින 30ක් සඳහා)</b>\n\n📋 <b>බැංකු ගිණුම් විස්තර:</b>\n• <b>Bank:</b> Bank of Ceylon (BOC)\n• <b>Account Name:</b> ${bocName}\n• <b>Account Number:</b> <code>${bocAcc}</code>\n• <b>Branch:</b> Sri Lanka\n━━━━━━━━━━━━━━━━━━━━\n📸 <b>පියවර:</b>\n1. ඉහත ගිණුමට LKR 350/= තැන්පත් කරන්න.\n2. ලැබෙන <b>Deposit Slip එකේ හෝ Online Banking Screenshot එකේ ඡායාරූපයක් (Photo) මෙම Bot වෙත එවන්න.</b>\n3. Admin පරීක්ෂා කර සුළු වේලාවකින් ඔබගේ VIP සක්‍රීය කරනු ඇත!`;
+  let planDetails = "";
+  if (plan === "weekly") {
+    planDetails = "💎 <b>තෝරාගත් පැකේජය:</b> 🗓️ Weekly Pass (දින 7) - <b>LKR 100/=</b>\n";
+  } else if (plan === "monthly") {
+    planDetails = "💎 <b>තෝරාගත් පැකේජය:</b> 🗓️ Monthly Pass (දින 30) - <b>LKR 300/=</b>\n";
+  } else if (plan === "lifetime") {
+    planDetails = "💎 <b>තෝරාගත් පැකේජය:</b> 👑 Lifetime VIP Pass (සදාකාලික) - <b>LKR 2500/=</b>\n";
+  } else {
+    planDetails = "💎 <b>පැකේජ මිල ගණන්:</b>\n• 🗓️ Weekly (දින 7): <b>LKR 100/=</b>\n• 🗓️ Monthly (දින 30): <b>LKR 300/=</b>\n• 👑 Lifetime (සදාකාලික): <b>LKR 2500/=</b>\n";
+  }
+
+  const bankMsg = `🏛️ <b>Bank of Ceylon (BOC) Payment Details:</b>\n━━━━━━━━━━━━━━━━━━━━\n${planDetails}\n📋 <b>බැංකු ගිණුම් විස්තර:</b>\n• <b>Bank:</b> Bank of Ceylon (BOC)\n• <b>Account Name:</b> ${bocName}\n• <b>Account Number:</b> <code>${bocAcc}</code>\n• <b>Branch:</b> Sri Lanka\n━━━━━━━━━━━━━━━━━━━━\n📸 <b>පියවර:</b>\n1. ඉහත ගිණුමට ඔබ තෝරාගත් පැකේජයට අදාළ මුදල තැන්පත් කරන්න.\n2. ලැබෙන <b>Deposit Slip එකේ හෝ Online Banking Screenshot එකේ ඡායාරූපයක් (Photo) මෙම Bot වෙත එවන්න.</b>\n3. Admin පරීක්ෂා කර සුළු වේලාවකින් ඔබගේ VIP සක්‍රීය කරනු ඇත!`;
 
   await sendReply(env, chatId, bankMsg);
 }
@@ -915,17 +1209,21 @@ async function handleSlipUpload(msg, env) {
     "✅ <b>Receipt Received!</b> / ඔබගේ බැංකු රිසිට්පත ලැබුණි.\nඅපගේ Admin විසින් මෙය පරීක්ෂා කර සුළු වේලාවකින් ඔබගේ VIP සක්‍රීය කරනු ඇත."
   );
 
-  // Forward to Admin with Action Buttons
+  // Forward to Admin with Multi-Tier Action Buttons
   const adminKb = {
     inline_keyboard: [
       [
-        { text: "✅ Approve (30 Days)", callback_data: `vip_approve_${reqId}` },
+        { text: "✅ Weekly (Rs. 100 / 7d)", callback_data: `vip_approve_weekly_${reqId}` },
+        { text: "✅ Monthly (Rs. 300 / 30d)", callback_data: `vip_approve_monthly_${reqId}` },
+      ],
+      [
+        { text: "👑 Lifetime (Rs. 2500)", callback_data: `vip_approve_lifetime_${reqId}` },
         { text: "❌ Reject", callback_data: `vip_reject_${reqId}` },
       ],
     ],
   };
 
-  const adminCaption = `👑 <b>New VIP Subscription Request #${reqId}</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 <b>User:</b> ${userName} (<code>${chatId}</code>)\n💵 <b>Plan:</b> 30-Day VIP (LKR 350 - BOC Bank)\n━━━━━━━━━━━━━━━━━━━━`;
+  const adminCaption = `👑 <b>New VIP Subscription Request #${reqId}</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 <b>User:</b> ${userName} (<code>${chatId}</code>)\n💵 <b>Bank:</b> Bank of Ceylon (BOC)\n━━━━━━━━━━━━━━━━━━━━\n<i>Slip එකේ මුදල අනුව සුදුසු Plan එක තෝරා Approve කරන්න:</i>`;
 
   const sendRes = await callTelegram(env.BOT_TOKEN, "sendPhoto", {
     chat_id: env.ADMIN_ID,
@@ -946,38 +1244,47 @@ async function handleSlipUpload(msg, env) {
   }
 }
 
-async function handleAdminVipApproval(env, adminChatId, reqId, isApproved) {
+async function handleAdminVipApproval(env, adminChatId, reqId, planOrDecision) {
   const req = await env.DB.prepare(`SELECT * FROM vip_requests WHERE id = ?`).bind(reqId).first();
   if (!req || req.status !== "pending") return;
 
-  if (isApproved) {
-    const thirtyDays = 30 * 24 * 60 * 60 * 1000;
-    const expiresAt = Date.now() + thirtyDays;
-
-    await env.DB.prepare(`
-      UPDATE users SET is_vip = 1, vip_until = ? WHERE user_id = ?
-    `).bind(expiresAt, req.user_id).run();
-
-    await env.DB.prepare(`UPDATE vip_requests SET status = 'approved' WHERE id = ?`).bind(reqId).run();
-
-    await sendReply(
-      env,
-      req.user_id,
-      "🎉 <b>VIP Membership Activated!</b>\n━━━━━━━━━━━━━━━━━━━━\nඔබගේ BOC බැංකු රිසිට්පත තහවුරු විය. දින 30ක VIP සාමාජිකත්වය සක්‍රීය කර ඇත. කිසිදු Ad එකක් නැතිව Files බාගත කරගත හැක!"
-    );
-
-    await sendReply(env, adminChatId, `✅ Approved VIP for User ${req.user_id}`);
-  } else {
+  if (planOrDecision === "reject" || planOrDecision === false) {
     await env.DB.prepare(`UPDATE vip_requests SET status = 'rejected' WHERE id = ?`).bind(reqId).run();
-
     await sendReply(
       env,
       req.user_id,
       "❌ <b>Payment Verification Failed!</b>\nඔබ එවූ රිසිට්පත වලංගු නොවේ. කරුණාකර නිවැරදි රිසිට්පතක් සමඟ නැවත උත්සාහ කරන්න."
     );
-
     await sendReply(env, adminChatId, `❌ Rejected VIP for User ${req.user_id}`);
+    return;
   }
+
+  // Calculate duration based on plan
+  let durationMs = 30 * 24 * 60 * 60 * 1000;
+  let planName = "Monthly VIP Pass (30 Days)";
+
+  if (planOrDecision === "weekly") {
+    durationMs = 7 * 24 * 60 * 60 * 1000;
+    planName = "Weekly VIP Pass (7 Days)";
+  } else if (planOrDecision === "lifetime") {
+    durationMs = 100 * 365 * 24 * 60 * 60 * 1000;
+    planName = "LIFETIME VIP Pass (Permanent)";
+  }
+
+  const expiresAt = Date.now() + durationMs;
+
+  await env.DB.prepare(`
+    UPDATE users SET is_vip = 1, vip_until = ? WHERE user_id = ?
+  `).bind(expiresAt, req.user_id).run();
+
+  await env.DB.prepare(`UPDATE vip_requests SET status = 'approved' WHERE id = ?`).bind(reqId).run();
+
+  const successMsg = planOrDecision === "lifetime"
+    ? `👑 <b>LIFETIME VIP Membership Activated!</b>\n━━━━━━━━━━━━━━━━━━━━\nඔබගේ BOC බැංකු රිසිට්පත තහවුරු විය. <b>සදාකාලික VIP සාමාජිකත්වය</b> සක්‍රීය කර ඇත!\n• කිසිදා කල් ඉකුත් නොවේ\n• 100% Zero Ads & Unlimited Downloads`
+    : `🎉 <b>${planName} Activated!</b>\n━━━━━━━━━━━━━━━━━━━━\nඔබගේ BOC බැංකු රිසිට්පත තහවුරු විය. ${planName} සාමාජිකත්වය සක්‍රීය කර ඇත. කිසිදු Ad එකක් හෝ Cooldown එකක් නැතිව Files බාගත කරගත හැක!`;
+
+  await sendReply(env, req.user_id, successMsg);
+  await sendReply(env, adminChatId, `✅ Approved ${planName} for User ${req.user_id}`);
 }
 
 // ================= VIRAL REFERRAL SYSTEM =================
@@ -1099,36 +1406,60 @@ async function generateBatchLink(env, chatId) {
 
   const botUsername = env.BOT_USERNAME || "PixelPopStorebot";
 
+  // 🎬 TMDb Auto Poster & Metadata Lookup
+  const tmdb = await fetchTmdbInfo(env, title);
+  const posterUrl = tmdb?.poster || null;
+  const displayTitle = tmdb?.title || title;
+  const yearText = tmdb?.year ? ` (${tmdb.year})` : "";
+  const ratingText = tmdb?.rating ? `⭐️ <b>Rating:</b> ${tmdb.rating} / 10\n` : "";
+  const overviewText = tmdb?.overview ? `📝 <i>${escapeHtml(tmdb.overview)}</i>\n━━━━━━━━━━━━━━━━━━━━\n` : "";
+
   let channelPostText = "";
 
   if (uniqueIds.length === 1) {
     // Single file (Movie)
     const token = `b_${crypto.randomUUID().slice(0, 8)}`;
     await env.DB.prepare(`
-      INSERT INTO batches (token, title, msg_ids, created_by, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(token, title, JSON.stringify(uniqueIds), chatId, Date.now()).run();
+      INSERT INTO batches (token, title, poster_url, msg_ids, created_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(token, displayTitle, posterUrl, JSON.stringify(uniqueIds), chatId, Date.now()).run();
 
     const link = `https://t.me/${botUsername}?start=${token}`;
-    channelPostText = `🎬 <b>${escapeHtml(title)}</b>\n━━━━━━━━━━━━━━━━━━━━\n📁 <b>Status:</b> Ready for Download\n⚡ <b>VIP Access:</b> Instant 0 Ads (No Delete)\n🆓 <b>Free Access:</b> Watch 5s Sponsor Ad\n━━━━━━━━━━━━━━━━━━━━\n👇 <b>Download Link:</b>\n🔗 <a href="${link}">${escapeHtml(title)}</a>`;
+    channelPostText = `🎬 <b>${escapeHtml(displayTitle)}</b>${yearText}\n${ratingText}━━━━━━━━━━━━━━━━━━━━\n${overviewText}⚡ <b>VIP Access:</b> Instant 0 Ads (Permanent)\n🆓 <b>Free Access:</b> Watch 5s Sponsor Ad\n━━━━━━━━━━━━━━━━━━━━\n👇 <b>Download Link:</b>\n🔗 <a href="${link}">${escapeHtml(displayTitle)}</a>`;
 
-    await callTelegram(env.BOT_TOKEN, "sendMessage", {
-      chat_id: chatId,
-      parse_mode: "HTML",
-      text: `🎉 <b>Movie Link Generated!</b>\n\n${channelPostText}\n\n<i>(Directly forward this post to your channel)</i>`,
-      reply_markup: {
-        inline_keyboard: [[{ text: "📥 Download / ලබාගන්න", url: link }]],
-      },
-    });
+    const adminKb = {
+      inline_keyboard: [[{ text: "📥 Download / ලබාගන්න", url: link }]],
+    };
+
+    let sentPhoto = false;
+    if (posterUrl && channelPostText.length <= 950) {
+      const pRes = await callTelegram(env.BOT_TOKEN, "sendPhoto", {
+        chat_id: chatId,
+        photo: posterUrl,
+        caption: `🎉 <b>Movie Link Generated!</b>\n\n${channelPostText}\n\n<i>(Directly forward this post to your channel)</i>`,
+        parse_mode: "HTML",
+        reply_markup: adminKb,
+      });
+      sentPhoto = pRes.ok;
+    }
+
+    if (!sentPhoto) {
+      await callTelegram(env.BOT_TOKEN, "sendMessage", {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text: `🎉 <b>Movie Link Generated!</b>\n\n${channelPostText}\n\n<i>(Directly forward this post to your channel)</i>`,
+        reply_markup: adminKb,
+      });
+    }
   } else {
     // Multi-file (Series / Complete Season)
     // 1. VIP Full Season Pack Link (All episodes in 1-Click)
     const packToken = `b_${crypto.randomUUID().slice(0, 8)}`;
-    const packTitle = `${title} (Complete Season Pack)`;
+    const packTitle = `${displayTitle} (Complete Season Pack)`;
     await env.DB.prepare(`
-      INSERT INTO batches (token, title, msg_ids, created_by, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(packToken, packTitle, JSON.stringify(uniqueIds), chatId, Date.now()).run();
+      INSERT INTO batches (token, title, poster_url, msg_ids, created_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(packToken, packTitle, posterUrl, JSON.stringify(uniqueIds), chatId, Date.now()).run();
 
     const packLink = `https://t.me/${botUsername}?start=${packToken}`;
 
@@ -1137,11 +1468,11 @@ async function generateBatchLink(env, chatId) {
     for (let i = 0; i < uniqueIds.length; i++) {
       const epNum = i + 1;
       const epToken = `b_${crypto.randomUUID().slice(0, 8)}`;
-      const epTitle = `${title} - Episode ${epNum}`;
+      const epTitle = `${displayTitle} - Episode ${epNum}`;
       await env.DB.prepare(`
-        INSERT INTO batches (token, title, msg_ids, created_by, created_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).bind(epToken, epTitle, JSON.stringify([uniqueIds[i]]), chatId, Date.now()).run();
+        INSERT INTO batches (token, title, poster_url, msg_ids, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).bind(epToken, epTitle, posterUrl, JSON.stringify([uniqueIds[i]]), chatId, Date.now()).run();
 
       const epLink = `https://t.me/${botUsername}?start=${epToken}`;
       epLinks.push({ epNum, link: epLink });
@@ -1152,18 +1483,34 @@ async function generateBatchLink(env, chatId) {
       .map((e) => `🔹 <b>Episode ${e.epNum < 10 ? "0" + e.epNum : e.epNum}:</b> <a href="${e.link}">Download Episode</a>`)
       .join("\n");
 
-    channelPostText = `🎬 <b>${escapeHtml(title)}</b>\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>VIP Members (Complete Season in 1-Click):</b>\n👉 <a href="${packLink}">⚡ Download Complete Season (${uniqueIds.length} Episodes)</a>\n\n🆓 <b>Free Users (Episode by Episode):</b>\n${epListText}\n━━━━━━━━━━━━━━━━━━━━\n<i>🛡️ Protected content: Forwarding is disabled.</i>`;
+    channelPostText = `🎬 <b>${escapeHtml(displayTitle)}</b>${yearText}\n${ratingText}━━━━━━━━━━━━━━━━━━━━\n${overviewText}👑 <b>VIP Members (Complete Season in 1-Click):</b>\n👉 <a href="${packLink}">⚡ Download Complete Season (${uniqueIds.length} Episodes)</a>\n\n🆓 <b>Free Users (Episode by Episode):</b>\n${epListText}\n━━━━━━━━━━━━━━━━━━━━\n<i>🛡️ Protected content: Forwarding is disabled.</i>`;
 
-    await callTelegram(env.BOT_TOKEN, "sendMessage", {
-      chat_id: chatId,
-      parse_mode: "HTML",
-      text: `🎉 <b>Series Links Generated!</b>\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>VIP Season Pack Link:</b>\n<code>${packLink}</code>\n\n📢 <b>Ready-to-Post Channel Message:</b>\n\n${channelPostText}`,
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "👑 Complete Season (VIP Pack)", url: packLink }],
-        ],
-      },
-    });
+    const adminKb = {
+      inline_keyboard: [
+        [{ text: "👑 Complete Season (VIP Pack)", url: packLink }],
+      ],
+    };
+
+    let sentPhoto = false;
+    if (posterUrl && channelPostText.length <= 950) {
+      const pRes = await callTelegram(env.BOT_TOKEN, "sendPhoto", {
+        chat_id: chatId,
+        photo: posterUrl,
+        caption: `🎉 <b>Series Links Generated!</b>\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>VIP Season Pack Link:</b>\n<code>${packLink}</code>\n\n📢 <b>Ready-to-Post Channel Message:</b>\n\n${channelPostText}`,
+        parse_mode: "HTML",
+        reply_markup: adminKb,
+      });
+      sentPhoto = pRes.ok;
+    }
+
+    if (!sentPhoto) {
+      await callTelegram(env.BOT_TOKEN, "sendMessage", {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text: `🎉 <b>Series Links Generated!</b>\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>VIP Season Pack Link:</b>\n<code>${packLink}</code>\n\n📢 <b>Ready-to-Post Channel Message:</b>\n\n${channelPostText}`,
+        reply_markup: adminKb,
+      });
+    }
   }
 
   // Clear admin draft title & batch queue
@@ -1204,6 +1551,207 @@ async function handleBroadcast(env, chatId, broadcastText) {
   }
 
   await sendReply(env, chatId, `✅ Broadcast complete! Delivered to ${count} / ${users.length} users.`);
+}
+
+// ================= TMDB AUTO POSTER & LIVE SEARCH & MOVIE REQUESTS =================
+async function fetchTmdbInfo(env, query) {
+  if (!env.TMDB_API_KEY) return null;
+  try {
+    const cleanQuery = query
+      .replace(/[\[\(].*?[\]\)]/g, "")
+      .replace(/\b(1080p|720p|480p|4k|hdr|bluray|web-dl|hdrip|x264|x265|hevc|season\s*\d+|s\d+e\d+|episode\s*\d+)\b/gi, "")
+      .trim();
+
+    if (!cleanQuery) return null;
+
+    const url = `https://api.themoviedb.org/3/search/multi?api_key=${encodeURIComponent(env.TMDB_API_KEY)}&query=${encodeURIComponent(cleanQuery)}&include_adult=false&language=en-US&page=1`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const item = (data.results || []).find((r) => r.media_type === "movie" || r.media_type === "tv") || data.results?.[0];
+    if (!item) return null;
+
+    const title = item.title || item.name || cleanQuery;
+    const year = (item.release_date || item.first_air_date || "").slice(0, 4);
+    const poster = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null;
+    const rating = item.vote_average ? item.vote_average.toFixed(1) : null;
+    let overview = item.overview || "";
+    if (overview.length > 250) {
+      overview = overview.slice(0, 247) + "...";
+    }
+
+    return {
+      id: item.id,
+      media_type: item.media_type || "movie",
+      title,
+      year,
+      poster,
+      rating,
+      overview,
+    };
+  } catch (err) {
+    console.error("TMDb fetch error:", err);
+    return null;
+  }
+}
+
+async function handleLiveSearch(env, chatId, query) {
+  query = (query || "").trim();
+  if (!query || query.length < 2) return;
+
+  const botUsername = env.BOT_USERNAME || "PixelPopStorebot";
+
+  // 1. Search Local Batches in D1
+  let batches = [];
+  try {
+    const searchPattern = `%${query}%`;
+    const batchRes = await env.DB.prepare(`
+      SELECT * FROM batches 
+      WHERE title LIKE ? 
+      ORDER BY created_at DESC 
+      LIMIT 5
+    `).bind(searchPattern).all();
+    batches = batchRes?.results || [];
+  } catch (e) {
+    console.error("Local search error:", e);
+  }
+
+  // 2. Query TMDb for Auto Poster & Synopsis
+  const tmdb = await fetchTmdbInfo(env, query);
+
+  // Case A: Files found in PixelPop database
+  if (batches.length > 0) {
+    const title = tmdb?.title || batches[0].title || query;
+    const yearStr = tmdb?.year ? ` (${tmdb.year})` : "";
+    const ratingStr = tmdb?.rating ? `⭐️ <b>Rating:</b> ${tmdb.rating} / 10\n` : "";
+    const overviewStr = tmdb?.overview ? `📝 <i>${escapeHtml(tmdb.overview)}</i>\n━━━━━━━━━━━━━━━━━━━━\n` : "";
+    const poster = tmdb?.poster || batches.find((b) => b.poster_url)?.poster_url || null;
+
+    let kbRows = batches.map((b) => [
+      { text: `📥 ${b.title || "Download File"}`, url: `https://t.me/${botUsername}?start=${b.token}` },
+    ]);
+
+    kbRows.push([{ text: "👑 Get VIP (Zero Ads / Unlimited)", callback_data: "vip_pay_bank" }]);
+
+    const caption = `🎬 <b>${escapeHtml(title)}</b>${yearStr}\n${ratingStr}━━━━━━━━━━━━━━━━━━━━\n${overviewStr}🍿 <b>PixelPop Database එකේ හමු වූ Files (${batches.length}):</b>\nපහත Button එකෙන් ලබාගන්න:`;
+
+    if (poster && caption.length <= 950) {
+      const photoRes = await callTelegram(env.BOT_TOKEN, "sendPhoto", {
+        chat_id: chatId,
+        photo: poster,
+        caption: caption,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: kbRows },
+      });
+      if (photoRes.ok) return;
+    }
+
+    // Fallback text if photo fails or no poster
+    await callTelegram(env.BOT_TOKEN, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text: caption,
+      reply_markup: { inline_keyboard: kbRows },
+    });
+    return;
+  }
+
+  // Case B: Not found in D1, but found on TMDb
+  if (tmdb) {
+    const yearStr = tmdb.year ? ` (${tmdb.year})` : "";
+    const ratingStr = tmdb.rating ? `⭐️ <b>Rating:</b> ${tmdb.rating} / 10\n` : "";
+    const overviewStr = tmdb.overview ? `📝 <i>${escapeHtml(tmdb.overview)}</i>\n` : "";
+
+    const caption = `🎬 <b>${escapeHtml(tmdb.title)}</b>${yearStr}\n${ratingStr}━━━━━━━━━━━━━━━━━━━━\n${overviewStr}━━━━━━━━━━━━━━━━━━━━\n⚠️ <b>මෙම චිත්‍රපටය තවමත් PixelPop හි නොමැත!</b>\n<i>(This title is not in our database yet)</i>\n\n👇 <b>ඔබට මෙය අවශ්‍ය නම් පහත Button එක ඔබා Request කරන්න:</b>`;
+
+    const cleanTitle = (tmdb.title || query).slice(0, 40);
+    const reqKb = {
+      inline_keyboard: [
+        [{ text: "📢 Request this Movie / අපෙන් ඉල්ලන්න", callback_data: `req_movie_${cleanTitle}` }],
+        [{ text: "👑 Get VIP Membership", callback_data: "vip_pay_bank" }],
+      ],
+    };
+
+    if (tmdb.poster && caption.length <= 950) {
+      const photoRes = await callTelegram(env.BOT_TOKEN, "sendPhoto", {
+        chat_id: chatId,
+        photo: tmdb.poster,
+        caption: caption,
+        parse_mode: "HTML",
+        reply_markup: reqKb,
+      });
+      if (photoRes.ok) return;
+    }
+
+    await callTelegram(env.BOT_TOKEN, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text: caption,
+      reply_markup: reqKb,
+    });
+    return;
+  }
+
+  // Case C: Neither found
+  const cleanTitle = query.slice(0, 40);
+  const notFoundKb = {
+    inline_keyboard: [
+      [{ text: "📢 Request Movie / අපෙන් ඉල්ලන්න", callback_data: `req_movie_${cleanTitle}` }],
+    ],
+  };
+
+  await callTelegram(env.BOT_TOKEN, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text: `🔍 <b>'${escapeHtml(query)}' හමු නොවීය!</b>\n━━━━━━━━━━━━━━━━━━━━\nනම නිවැරදිදැයි පරීක්ෂා කර නැවත Search කරන්න.\n\n💡 <b>අපෙන් ඉල්ලීමට:</b>\n<code>/request ${escapeHtml(query)}</code> ලෙස Type කරන්න හෝ පහත Button එක ඔබන්න.`,
+    reply_markup: notFoundKb,
+  });
+}
+
+async function handleMovieRequest(env, chatId, userName, query) {
+  query = (query || "").trim();
+  if (!query) return;
+
+  await ensureSchema(env);
+
+  let reqId = Date.now();
+  try {
+    const res = await env.DB.prepare(`
+      INSERT INTO requests (user_id, user_name, query, status, created_at)
+      VALUES (?, ?, ?, 'pending', ?)
+    `).bind(chatId, userName, query, Date.now()).run();
+    if (res?.meta?.last_row_id) {
+      reqId = res.meta.last_row_id;
+    }
+  } catch (e) {
+    console.error("Movie request insert error:", e);
+  }
+
+  // User notification
+  await sendReply(
+    env,
+    chatId,
+    `✅ <b>Request Received / ඉල්ලීම භාරගන්නා ලදී!</b>\n━━━━━━━━━━━━━━━━━━━━\n🎬 <b>Title:</b> <i>${escapeHtml(query)}</i>\n\nඔබගේ ඉල්ලීම Admin වෙත යොමු කරන ලදී. අප කඩිනමින් මෙය Upload කිරීමට කටයුතු කරන්නෙමු!`
+  );
+
+  // Admin notification
+  const adminKb = {
+    inline_keyboard: [
+      [
+        { text: "✅ Uploaded (Notify User)", callback_data: `req_fulfill_${reqId}` },
+        { text: "❌ Decline", callback_data: `req_decline_${reqId}` },
+      ],
+    ],
+  };
+
+  const adminMsg = `📩 <b>New Movie Request #${reqId}</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 <b>User:</b> ${userName} (<code>${chatId}</code>)\n🎬 <b>Requested:</b> <b>${escapeHtml(query)}</b>\n━━━━━━━━━━━━━━━━━━━━`;
+
+  await callTelegram(env.BOT_TOKEN, "sendMessage", {
+    chat_id: env.ADMIN_ID,
+    parse_mode: "HTML",
+    text: adminMsg,
+    reply_markup: adminKb,
+  });
 }
 
 // ================= GENERAL HELPERS =================
@@ -1348,6 +1896,17 @@ async function ensureSchema(env) {
       )
     `).run();
 
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        user_name TEXT,
+        query TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at INTEGER
+      )
+    `).run();
+
     // Migrations for pre-existing tables created under old schema
     const migrations = [
       "ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'si'",
@@ -1358,8 +1917,13 @@ async function ensureSchema(env) {
       "ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0",
       "ALTER TABLE users ADD COLUMN referred_by TEXT",
       "ALTER TABLE users ADD COLUMN created_at INTEGER",
+      "ALTER TABLE users ADD COLUMN verify_token TEXT",
+      "ALTER TABLE users ADD COLUMN ad_verified INTEGER DEFAULT 0",
+      "ALTER TABLE users ADD COLUMN last_download_at INTEGER DEFAULT 0",
       "ALTER TABLE admin_batch ADD COLUMN admin_id TEXT",
       "ALTER TABLE deletions ADD COLUMN reminded INTEGER DEFAULT 0",
+      "ALTER TABLE batches ADD COLUMN poster_url TEXT",
+      "ALTER TABLE vip_requests ADD COLUMN plan TEXT DEFAULT 'monthly'",
     ];
 
     for (const q of migrations) {

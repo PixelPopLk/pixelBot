@@ -19,6 +19,13 @@ FORCE_SUB_CHANNEL_ID = "-1003677392472"
 FORCE_SUB_CHANNEL_LINK = "https://t.me/pixel_pop_lk"
 FORCE_SUB_CHANNEL_NAME = "PixelPop LK"
 
+# 🛡️ Backup Bot & Channel (Main Bot එකට ප්‍රශ්නයක් වුවහොත් භාවිතයට):
+BACKUP_BOT_USERNAME = "PixelPopBackupBot" # ඔබගේ 2nd Backup Bot එකේ Username එක මෙතනට දාන්න
+BACKUP_CHANNEL_LINK = "https://t.me/pixel_pop_lk" # Backup Channel Link එක
+
+# 🎬 TMDb Auto Poster API Key (themoviedb.org වෙතින් නොමිලේ ලබාගත හැකි API Key එක):
+TMDB_API_KEY = "" # මෙතනට ඔබගේ TMDb v3 API Key එක ඇතුළත් කරන්න
+
 # ⏰ Cron Trigger: සෑම විනාඩි 10කට වරක් Auto-Deletion සහ Reminder ක්‍රියාත්මක කිරීම
 [triggers]
 crons = ["*/10 * * * *"]
