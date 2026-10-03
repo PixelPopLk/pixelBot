@@ -24,7 +24,7 @@ BACKUP_BOT_USERNAME = "PixelpopbackupBot" # ඔබගේ 2nd Backup Bot එක�
 BACKUP_CHANNEL_LINK = "https://t.me/pixelpoplk" # Backup Channel Link එක
 
 # 🎬 TMDb Auto Poster API Key (themoviedb.org වෙතින් නොමිලේ ලබාගත හැකි API Key එක):
-TMDB_API_KEY = "" # මෙතනට ඔබගේ TMDb v3 API Key එක ඇතුළත් කරන්න
+TMDB_API_KEY = "b7c939e7834039a121eed78ef1c07116" # මෙතනට ඔබගේ TMDb v3 API Key එක ඇතුළත් කරන්න
 
 # ⚡ Security & Business Settings:
 FREE_DAILY_LIMIT = "0" # Free users ලාට Downloads Limit එකක් නැත (0 = Unlimited)
