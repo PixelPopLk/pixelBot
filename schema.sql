@@ -2,7 +2,7 @@
 -- PixelPop Telegram Bot Database Schema (D1)
 -- ==========================================
 
--- 1. Users Table (User profiles, preferences, VIP status, referrals)
+-- 1. Users Table (User profiles, preferences, VIP status, referrals, security & quotas)
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     username TEXT,
@@ -15,11 +15,19 @@ CREATE TABLE IF NOT EXISTS users (
     vip_until INTEGER DEFAULT 0,-- Epoch timestamp when VIP expires
     referred_by TEXT,           -- User ID of the referrer
     referral_count INTEGER DEFAULT 0, -- Count of valid invites
+    is_banned INTEGER DEFAULT 0, -- 1 if user is banned
+    daily_downloads INTEGER DEFAULT 0, -- Count of free downloads used today
+    quota_reset_at INTEGER DEFAULT 0,  -- Timestamp when daily download quota resets
+    verify_token TEXT,          -- Cryptographic single-use session verification token
+    token_created_at INTEGER DEFAULT 0, -- Creation timestamp of verification token (TTL)
+    ad_verified INTEGER DEFAULT 0,      -- 1 if ad verified by website
+    last_download_at INTEGER DEFAULT 0, -- Timestamp of last download (5-min cooldown)
     created_at INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_vip ON users(is_vip, vip_until);
 CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by);
+CREATE INDEX IF NOT EXISTS idx_users_banned ON users(is_banned);
 
 -- 2. Batches Table (Secure random tokens mapping to file message IDs)
 CREATE TABLE IF NOT EXISTS batches (
@@ -27,9 +35,16 @@ CREATE TABLE IF NOT EXISTS batches (
     title TEXT,                 -- Movie / Series Title (Optional)
     poster_url TEXT,            -- TMDb Poster Image URL (Optional)
     msg_ids TEXT NOT NULL,      -- JSON array of Storage Channel message IDs
+    series_name TEXT,           -- Root Series Title (for TV series grouping)
+    season INTEGER DEFAULT 1,   -- Season Number (1, 2, ...)
+    episode INTEGER DEFAULT 0,  -- Episode Number (1, 2, ...; 0 for complete pack)
+    quality TEXT,               -- Video Quality ('720p', '1080p', '4K', etc.)
     created_by TEXT,            -- Admin user ID
     created_at INTEGER
 );
+
+CREATE INDEX IF NOT EXISTS idx_batches_series ON batches(series_name);
+CREATE INDEX IF NOT EXISTS idx_batches_season ON batches(series_name, season);
 
 -- 3. Admin Batch Queue (Tracks pending forwarded files per admin)
 CREATE TABLE IF NOT EXISTS admin_batch (

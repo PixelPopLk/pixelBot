@@ -26,6 +26,10 @@ BACKUP_CHANNEL_LINK = "https://t.me/pixel_pop_lk" # Backup Channel Link එක
 # 🎬 TMDb Auto Poster API Key (themoviedb.org වෙතින් නොමිලේ ලබාගත හැකි API Key එක):
 TMDB_API_KEY = "" # මෙතනට ඔබගේ TMDb v3 API Key එක ඇතුළත් කරන්න
 
+# ⚡ Security & Business Settings:
+FREE_DAILY_LIMIT = "0" # Free users ලාට Downloads Limit එකක් නැත (0 = Unlimited)
+CO_ADMINS = "" # අමතර Admin / Moderator IDs කොමාවෙන් වෙන්කර දාන්න (උදා: "1234567,7891011")
+
 # ⏰ Cron Trigger: සෑම විනාඩි 10කට වරක් Auto-Deletion සහ Reminder ක්‍රියාත්මක කිරීම
 [triggers]
 crons = ["*/10 * * * *"]
