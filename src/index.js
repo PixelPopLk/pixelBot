@@ -755,7 +755,7 @@ async function handleCallbackQuery(cb, env) {
       data === "vip_plan_monthly" || data === "vip_plan_lifetime" || data === "vip_pay_bank") {
     if (!(await arePaidPlansEnabled(env))) {
       await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
-        callback_query_id: cb.id, text: "Paid plans OFF. Watch the ad for a free download.", show_alert: true,
+        callback_query_id: cb.id, text: "Use the free download option to continue.", show_alert: true,
       });
       await sendReply(env, chatId, "📢 Paid Plans OFF. Ad එක බලලා සාමාන්‍ය විදිහට file එක ගන්න.");
       return;
@@ -1518,7 +1518,7 @@ async function handlePreCheckoutQuery(query, env) {
     query.currency === "XTR" && query.total_amount === expected;
   await callTelegram(env.BOT_TOKEN, "answerPreCheckoutQuery", {
     pre_checkout_query_id: query.id, ok: valid,
-    ...(valid ? {} : { error_message: "Paid plans are off or invoice details are invalid. Use the ad-supported download." }),
+    ...(valid ? {} : { error_message: "Invoice could not be processed. Please use the free download option." }),
   });
 }
 
@@ -1533,7 +1533,7 @@ async function handleSuccessfulPayment(msg, env) {
   if (!(await arePaidPlansEnabled(env))) {
     try { await callTelegram(env.BOT_TOKEN, "refundStarPayment", { user_id: Number(chatId), telegram_payment_charge_id: chargeId }); }
     catch (err) { console.error("Stars refund failed:", err); }
-    await sendReply(env, chatId, "Paid Plans OFF. Refund request යොමු කළා; Telegram payment history පරීක්ෂා කරන්න.");
+    await sendReply(env, chatId, "මෙම ගනුදෙනුව process කළ නොහැකි විය. Telegram payment history පරීක්ෂා කරන්න.");
     return;
   }
   const amounts = { vip_stars_7d: 20, vip_30d: 60, vip_stars_30d: 60, vip_stars_lifetime: 500 };
