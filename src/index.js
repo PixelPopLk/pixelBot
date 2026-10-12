@@ -1807,7 +1807,7 @@ async function grantReferralIfPending(env, userId) {
     const count = refUser?.referral_count || 1;
 
     // Award 24-hour VIP pass every 3 referrals (stacks automatically)
-    if (count % 3 === 0) {
+    if (count % 3 === 0 && await arePaidPlansEnabled(env)) {
       const oneDay = 24 * 60 * 60 * 1000;
       const currentExpiry = (refUser.is_vip && refUser.vip_until > Date.now()) ? refUser.vip_until : Date.now();
       const newExpiry = currentExpiry + oneDay;
@@ -2095,6 +2095,7 @@ async function handleAdminPanelCallback(cb, env) {
       ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value
     `).bind(nextEnabled ? "1" : "0").run();
     if (!nextEnabled) {
+      // Clear all active VIP entitlements. Payment ledger remains private for accounting.
       await env.DB.prepare("UPDATE users SET is_vip = 0, vip_until = 0 WHERE is_vip != 0 OR vip_until != 0").run();
     }
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
@@ -2705,7 +2706,7 @@ async function editTelegramMessage(env, cb, textOrCaption, replyMarkup) {
     const res = await callTelegram(env.BOT_TOKEN, "editMessageCaption", {
       chat_id: chatId,
       message_id: messageId,
-      caption: textOrCaption,
+      caption: shownText,
       parse_mode: "HTML",
       reply_markup: replyMarkup,
     });
@@ -2715,14 +2716,19 @@ async function editTelegramMessage(env, cb, textOrCaption, replyMarkup) {
   await callTelegram(env.BOT_TOKEN, "editMessageText", {
     chat_id: chatId,
     message_id: messageId,
-    text: textOrCaption,
+    text: shownText,
     parse_mode: "HTML",
     reply_markup: replyMarkup,
   });
 }
 
 async function sendSearchReply(env, chatId, poster, textOrCaption, inlineKeyboard, replyToMsgId = null) {
-  const keyboardObj = Array.isArray(inlineKeyboard) ? { inline_keyboard: inlineKeyboard } : inlineKeyboard;
+  let shownText = textOrCaption;
+  let keyboardObj = Array.isArray(inlineKeyboard) ? { inline_keyboard: inlineKeyboard } : inlineKeyboard;
+  if (!isAuthorizedAdmin(chatId.toString(), env) && !(await arePaidPlansEnabled(env))) {
+    shownText = hidePaidStatusText(shownText);
+    if (keyboardObj?.inline_keyboard) keyboardObj = { ...keyboardObj, inline_keyboard: keyboardObj.inline_keyboard.map(row => row.filter(btn => !/vip|paid|stars|bank/i.test(`${btn.text || ""} ${btn.callback_data || ""} ${btn.url || ""}`))).filter(row => row.length) };
+  }
 
   if (poster && textOrCaption.length <= 950) {
     const payload = {
@@ -3631,11 +3637,16 @@ async function ensureSchema(env) {
 }
 
 async function sendReply(env, chatId, htmlText) {
-  return callTelegram(env.BOT_TOKEN, "sendMessage", {
-    chat_id: chatId,
-    parse_mode: "HTML",
-    text: htmlText,
-  });
+  let text = htmlText;
+  if (!isAuthorizedAdmin(chatId.toString(), env) && !(await arePaidPlansEnabled(env))) text = hidePaidStatusText(text);
+  return callTelegram(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text });
+}
+
+function hidePaidStatusText(value) {
+  const blocked = /VIP|paid|membership|Telegram Stars|\\bStars\\b|LKR\\s*\\d|Rs\\.\\s*\\d|bank slip|Bank of Ceylon|zero ads|no cooldown|lifetime/i;
+  const kept = String(value || "").split("\\n").filter(line => !blocked.test(line));
+  const result = kept.join("\\n").replace(/\\n{3,}/g, "\\n\\n").trim();
+  return result || "📢 දැනට සාමාන්‍ය Free Download ක්‍රමය භාවිතා කරන්න. Ad එක බලලා file එක ලබාගන්න.";
 }
 
 function escapeHtml(text) {
