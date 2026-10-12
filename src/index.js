@@ -757,7 +757,7 @@ async function handleCallbackQuery(cb, env) {
       await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
         callback_query_id: cb.id, text: "Use the free download option to continue.", show_alert: true,
       });
-      await sendReply(env, chatId, "📢 Paid Plans OFF. Ad එක බලලා සාමාන්‍ය විදිහට file එක ගන්න.");
+      await sendReply(env, chatId, "Free download එක ලබාගැනීමට Ad එක බලන්න.");
       return;
     }
   }
@@ -1497,7 +1497,7 @@ async function handleScheduledTasks(env) {
 // ================= TELEGRAM STARS (XTR) PAYMENTS =================
 async function sendStarsInvoice(env, chatId, { title, description, payload, starsAmount }) {
   if (!(await arePaidPlansEnabled(env))) {
-    await sendReply(env, chatId, "📢 Paid Plans OFF. Ad එක බලලා file එක ගන්න.");
+    await sendReply(env, chatId, "Free download එක ලබාගැනීමට Ad එක බලන්න.");
     return;
   }
   await callTelegram(env.BOT_TOKEN, "sendInvoice", {
@@ -1600,7 +1600,7 @@ async function sendVipInfoCard(env, chatId) {
     ] : [],
   };
   if (!paidEnabled) {
-    await sendReply(env, chatId, "📢 <b>Paid Plans දැනට OFF.</b>\nAd එක බලලා සාමාන්‍ය විදිහට files ලබාගන්න.");
+    await sendReply(env, chatId, "📢 Free download එක ලබාගැනීමට Ad එක බලන්න.");
     return;
   }
 
