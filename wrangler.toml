@@ -23,8 +23,7 @@ FORCE_SUB_CHANNEL_NAME = "PixelPop LK"
 BACKUP_BOT_USERNAME = "PixelpopbackupBot" # ඔබගේ 2nd Backup Bot එකේ Username එක මෙතනට දාන්න
 BACKUP_CHANNEL_LINK = "https://t.me/pixelpoplk" # Backup Channel Link එක
 
-# 🎬 TMDb Auto Poster API Key (themoviedb.org වෙතින් නොමිලේ ලබාගත හැකි API Key එක):
-TMDB_API_KEY = "b7c939e7834039a121eed78ef1c07116" # මෙතනට ඔබගේ TMDb v3 API Key එක ඇතුළත් කරන්න
+# Set TMDB_API_KEY securely with: npx wrangler secret put TMDB_API_KEY
 
 # ⚡ Security & Business Settings:
 FREE_DAILY_LIMIT = "0" # Free users ලාට Downloads Limit එකක් නැත (0 = Unlimited)
@@ -34,9 +33,9 @@ CO_ADMINS = "" # අමතර Admin / Moderator IDs කොමාවෙන් ව
 [triggers]
 crons = ["*/10 * * * *"]
 
-# 🗄️ Cloudflare D1 Database Binding (ඔබේ Database Name & ID එක ඇතුළත් කරන්න):
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "pixelpop-db"
-# database_id = "your-d1-database-id-here"
+# 🗄️ Cloudflare D1 Database Binding
+[[d1_databases]]
+binding = "DB"
+database_name = "pixelpop-db"
+database_id = "e8daf30e-ef5c-4fbf-85ec-2ebaea53dade"
 
