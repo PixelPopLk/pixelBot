@@ -66,7 +66,7 @@ async function isUserBanned(env, userId) {
     const u = await env.DB.prepare(`SELECT is_banned FROM users WHERE user_id = ?`).bind(userId.toString()).first();
     return u?.is_banned === 1;
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -1031,11 +1031,12 @@ async function handleCallbackQuery(cb, env) {
   }
 
   if (data.startsWith("br_mq_")) {
-    // format: br_mq_${chosenToken}_${rootToken}
-    const parts = data.split("_");
-    const chosenToken = parts[2];
-    const rootToken = parts[3] || chosenToken;
-    await handleConfirmMovieDownload(env, cb, chosenToken, rootToken);
+    const match = data.match(/^br_mq_(b_[a-f0-9-]{8,40})_(b_[a-f0-9-]{8,40})$/i);
+    if (!match) {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "Invalid batch token.", show_alert: true });
+      return;
+    }
+    await handleConfirmMovieDownload(env, cb, match[1], match[2]);
     return;
   }
 
@@ -1046,29 +1047,23 @@ async function handleCallbackQuery(cb, env) {
   }
 
   if (data.startsWith("br_sea_")) {
-    const parts = data.split("_");
-    const token = parts[2];
-    const seasonNum = parseInt(parts[3] || "1", 10);
-    await handleBrowseSeasonEpisodes(env, cb, token, seasonNum);
+    const match = data.match(/^br_sea_(b_[a-f0-9-]{8,40})_(\d{1,3})$/i);
+    if (!match) return;
+    await handleBrowseSeasonEpisodes(env, cb, match[1], Number(match[2]));
     return;
   }
 
   if (data.startsWith("br_ep_")) {
-    const parts = data.split("_");
-    const epToken = parts[2];
-    const parentToken = parts[3] || epToken;
-    const seasonNum = parseInt(parts[4] || "1", 10);
-    await handleBrowseEpisodeQuality(env, cb, epToken, parentToken, seasonNum);
+    const match = data.match(/^br_ep_(b_[a-f0-9-]{8,40})_(b_[a-f0-9-]{8,40})_(\d{1,3})$/i);
+    if (!match) return;
+    await handleBrowseEpisodeQuality(env, cb, match[1], match[2], Number(match[3]));
     return;
   }
 
   if (data.startsWith("br_eq_")) {
-    // format: br_eq_${chosenToken}_${parentToken}_${seasonNum}
-    const parts = data.split("_");
-    const chosenToken = parts[2];
-    const parentToken = parts[3] || chosenToken;
-    const seasonNum = parseInt(parts[4] || "1", 10);
-    await handleConfirmEpisodeDownload(env, cb, chosenToken, parentToken, seasonNum);
+    const match = data.match(/^br_eq_(b_[a-f0-9-]{8,40})_(b_[a-f0-9-]{8,40})_(\d{1,3})$/i);
+    if (!match) return;
+    await handleConfirmEpisodeDownload(env, cb, match[1], match[2], Number(match[3]));
     return;
   }
 
@@ -1132,11 +1127,6 @@ async function handleAdVerification(env, chatId, cb) {
     return;
   }
 
-  // Mark as delivered
-  await env.DB.prepare(`
-    UPDATE users SET delivered = 1 WHERE user_id = ?
-  `).bind(chatId).run();
-
   await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
     callback_query_id: cb.id,
     text: "✅ Verification Successful! Sending files...\nතහවුරු විය! Files එවමින් පවතී...",
@@ -1151,12 +1141,15 @@ async function handleAdVerification(env, chatId, cb) {
   }
 
   // Check if user is VIP (VIP files are never auto-deleted)
-  const isVip = isUserVipActive(user);
-  await sendBatchFiles(env, chatId, idsToSend, isVip);
+  const isVip = await arePaidPlansEnabled(env) && isUserVipActive(user);
+  const results = await sendBatchFiles(env, chatId, idsToSend, isVip);
+  if (idsToSend.length > 0 && results.length === idsToSend.length && results.every((r) => r?.ok)) {
+    await env.DB.prepare("UPDATE users SET delivered = 1 WHERE user_id = ?").bind(chatId).run();
+  }
 }
 
 // ================= SESSION & PREVIEW CARDS =================
-async function initiateFileSession(env, chatId, payload) {
+async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
   try {
     let targetMsgIds = [];
     let movieTitle = null;
@@ -1204,6 +1197,16 @@ async function initiateFileSession(env, chatId, payload) {
         `👑 <b>VIP Member Detected!</b>\nBypassing all ads. Delivering your files immediately without expiry limit...`
       );
       await sendBatchFiles(env, chatId, targetMsgIds, true);
+      return;
+    }
+
+    // A verified 5-Star Fast Pass skips free cooldown and ad checks, but retains
+    // the normal free-file expiry policy.
+    if (paidFastPass && paidPlansEnabled) {
+      const results = await sendBatchFiles(env, chatId, targetMsgIds, false);
+      if (results.length && results.every((r) => r?.ok)) {
+        await env.DB.prepare("UPDATE users SET delivered = 1 WHERE user_id = ?").bind(chatId).run();
+      }
       return;
     }
 
@@ -1551,7 +1554,7 @@ async function handleSuccessfulPayment(msg, env) {
       chatId,
       "⚡ <b>Fast Pass Activated!</b>\nThank you for paying with Stars. Delivering your files immediately..."
     );
-    await initiateFileSession(env, chatId, batchPayload);
+    await initiateFileSession(env, chatId, batchPayload, true);
   } else if (payload === "vip_stars_7d") {
     const sevenDays = 7 * 24 * 60 * 60 * 1000;
     const expiresAt = Date.now() + sevenDays;
