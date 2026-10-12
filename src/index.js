@@ -1218,7 +1218,6 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
     const titleDisplay = movieTitle ? `🎬 <b>${escapeHtml(movieTitle)}</b>\n` : "";
     const fileCount = targetMsgIds.length;
 
-    const paidPlansEnabled = await arePaidPlansEnabled(env);
     const keyboard = {
       inline_keyboard: [
         [{ text: "🎬 Watch Ad (Free / නොමිලේ)", url: adUrl }],
