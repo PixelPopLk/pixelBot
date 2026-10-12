@@ -33,9 +33,9 @@ CO_ADMINS = "" # අමතර Admin / Moderator IDs කොමාවෙන් ව
 [triggers]
 crons = ["*/10 * * * *"]
 
-# 🗄️ Cloudflare D1 Database Binding (ඔබේ Database Name & ID එක ඇතුළත් කරන්න):
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "pixelpop-db"
-# database_id = "your-d1-database-id-here"
+# 🗄️ Cloudflare D1 Database Binding
+[[d1_databases]]
+binding = "DB"
+database_name = "pixelpop-db"
+database_id = "e8daf30e-ef5c-4fbf-85ec-2ebaea53dade"
 
