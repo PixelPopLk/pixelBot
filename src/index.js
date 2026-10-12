@@ -3610,30 +3610,10 @@ function escapeHtml(text) {
 }
 
 async function callTelegram(token, method, body) {
-  let bodyToSend = body;
-  const messageMethods = new Set(["sendMessage", "sendPhoto", "editMessageText", "editMessageCaption"]);
-  const chatId = body?.chat_id == null ? "" : body.chat_id.toString();
-
-  // Enforce Paid Plans OFF consistently across every user-facing card, not just search results.
-  if (messageMethods.has(method) && chatId && !isAuthorizedAdmin(chatId, env) && !(await arePaidPlansEnabled(env))) {
-    bodyToSend = { ...body };
-    if (typeof bodyToSend.text === "string") bodyToSend.text = hidePaidStatusText(bodyToSend.text);
-    if (typeof bodyToSend.caption === "string") bodyToSend.caption = hidePaidStatusText(bodyToSend.caption);
-    if (bodyToSend.reply_markup?.inline_keyboard) {
-      const paidButtonPattern = /vip|paid|stars|bank|fast.?pass|telegram stars|membership|lifetime|weekly pass|monthly pass/i;
-      bodyToSend.reply_markup = {
-        ...bodyToSend.reply_markup,
-        inline_keyboard: bodyToSend.reply_markup.inline_keyboard
-          .map((row) => row.filter((button) => !paidButtonPattern.test(String(button.text || "") + " " + String(button.callback_data || "") + " " + String(button.url || "")))
-          .filter((row) => row.length > 0),
-      };
-    }
-  }
-
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(bodyToSend),
+    body: JSON.stringify(body),
   });
   return res.json();
 }
