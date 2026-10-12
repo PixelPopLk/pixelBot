@@ -3578,7 +3578,7 @@ async function sendReply(env, chatId, htmlText) {
 }
 
 function hidePaidStatusText(value) {
-  const blocked = /VIP|paid|membership|Telegram Stars|\\bStars\\b|LKR\\s*\\d|Rs\\.\\s*\\d|bank slip|Bank of Ceylon|zero ads|no cooldown|lifetime/i;
+  const blocked = /VIP|paid|membership|Telegram Stars|\bStars\b|LKR\s*\d|Rs\.\s*\d|bank slip|Bank of Ceylon|zero ads|no cooldown|lifetime/i;
   const kept = String(value || "").split(/\r?\n/).filter(line => !blocked.test(line));
   const result = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
   return result || "📢 දැනට සාමාන්‍ය Free Download ක්‍රමය භාවිතා කරන්න. Ad එක බලලා file එක ලබාගන්න.";
