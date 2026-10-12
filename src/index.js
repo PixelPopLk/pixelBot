@@ -1701,6 +1701,11 @@ async function handleAdminVipApproval(env, adminChatId, reqId, planOrDecision) {
   const req = await env.DB.prepare(`SELECT * FROM vip_requests WHERE id = ?`).bind(reqId).first();
   if (!req || req.status !== "pending") return;
 
+  if (planOrDecision !== "reject" && planOrDecision !== false && !(await arePaidPlansEnabled(env))) {
+    await sendReply(env, adminChatId, "⛔ Paid Plans OFF. VIP approval is disabled; users can download by watching ads.");
+    return;
+  }
+
   if (planOrDecision === "reject" || planOrDecision === false) {
     await env.DB.prepare(`UPDATE vip_requests SET status = 'rejected' WHERE id = ?`).bind(reqId).run();
     await sendReply(
