@@ -139,57 +139,57 @@ export default {
       );
     }
 
-    // 🛡️ 2. AD CLICK & VERIFICATION RECORD (Strict Cryptographic Token-Only Anti-Bypass)
+    // AD SESSION: starting an ad must NEVER mark it as completed.
     if (url.pathname === "/verify" || url.pathname === "/verify_ad" || url.pathname === "/ad_started") {
       const userId = url.searchParams.get("u") || url.searchParams.get("a");
       const token = url.searchParams.get("t");
+      const jsonHeaders = { ...corsHeaders, "Content-Type": "application/json", "Cache-Control": "no-store" };
 
       if (!userId || !token) {
-        return new Response(
-          JSON.stringify({ ok: false, error: "Access denied. Valid user ID and secret token are required." }),
-          {
-            status: 400,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      if (env.DB) {
-        const user = await env.DB.prepare(`
-          SELECT verify_token, token_created_at FROM users WHERE user_id = ?
-        `).bind(userId.toString()).first();
-
-        if (!user || !user.verify_token || user.verify_token !== token) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "Invalid or expired verification token." }),
-            {
-              status: 400,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
-
-        // Token TTL Check (15-Minute Expiry Limit)
-        const TOKEN_TTL_MS = 15 * 60 * 1000;
-        if (user.token_created_at && (Date.now() - user.token_created_at > TOKEN_TTL_MS)) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "Verification token expired (15-minute limit exceeded). Please re-open the link from the bot." }),
-            {
-              status: 400,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
-
-        await env.DB.prepare(`
-          UPDATE users SET ad_verified = 1, ad_started_at = ? WHERE user_id = ?
-        `).bind(Date.now(), userId.toString()).run();
-
-        return new Response(JSON.stringify({ ok: true, status: "verified" }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        return new Response(JSON.stringify({ ok: false, error: "User ID and verification token are required." }), {
+          status: 400, headers: jsonHeaders,
         });
       }
-      return new Response("OK", { headers: corsHeaders });
+      if (!env.DB) {
+        return new Response(JSON.stringify({ ok: false, error: "Verification database unavailable." }), {
+          status: 503, headers: jsonHeaders,
+        });
+      }
+
+      const user = await env.DB.prepare(`
+        SELECT verify_token, token_created_at, ad_started_at FROM users WHERE user_id = ?
+      `).bind(userId.toString()).first();
+
+      if (!user || !user.verify_token || user.verify_token !== token) {
+        return new Response(JSON.stringify({ ok: false, error: "Invalid verification token." }), {
+          status: 400, headers: jsonHeaders,
+        });
+      }
+
+      const now = Date.now();
+      const TOKEN_TTL_MS = 15 * 60 * 1000;
+      if (!user.token_created_at || now - Number(user.token_created_at) > TOKEN_TTL_MS || now < Number(user.token_created_at)) {
+        return new Response(JSON.stringify({ ok: false, error: "Verification link expired. Request a fresh download link from the bot." }), {
+          status: 400, headers: jsonHeaders,
+        });
+      }
+
+      if (url.pathname === "/ad_started") {
+        // Idempotent start timestamp: repeated page loads cannot reset the timer.
+        if (!user.ad_started_at) {
+          await env.DB.prepare(`
+            UPDATE users SET ad_started_at = ?, ad_verified = 0 WHERE user_id = ? AND verify_token = ?
+          `).bind(now, userId.toString(), token).run();
+        }
+        return new Response(JSON.stringify({ ok: true, status: "ad_started" }), { headers: jsonHeaders });
+      }
+
+      // No trusted ad-provider completion callback is configured. Do not let
+      // a browser request claim that the ad was completed.
+      return new Response(JSON.stringify({
+        ok: false,
+        error: "Ad completion cannot be confirmed by this endpoint. Return to the bot after the ad and use the verification button."
+      }), { status: 403, headers: jsonHeaders });
     }
 
     // 3. TELEGRAM WEBHOOK
@@ -1104,28 +1104,33 @@ async function handleAdVerification(env, chatId, cb) {
     return;
   }
 
-  // 1. Check if ad was verified with secret token or opened
-  if (user.ad_verified !== 1 && !user.ad_started_at) {
+  // Require an ad-start record and a minimum elapsed time. This is only a
+  // basic anti-instant-bypass heuristic, not proof of provider completion.
+  const adStartedAt = Number(user.ad_started_at || 0);
+  if (!adStartedAt) {
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: cb.id,
-      text: "❌ You haven't completed the sponsor ad on the website yet!\nඔබ තවමත් Sponsor Ad එක සම්පූර්ණ කර නැත!",
+      text: "❌ මුලින් Watch Ad බොත්තම ඔබලා ad එක විවෘත කරන්න.",
       show_alert: true,
     });
     return;
   }
 
-  // 2. 5-second anti-cheat verification
-  const startTime = user.ad_started_at || 0;
-  const timePassedSeconds = (Date.now() - startTime) / 1000;
-  if (timePassedSeconds < 5) {
-    const remaining = Math.ceil(5 - timePassedSeconds);
+  const elapsedMs = Date.now() - adStartedAt;
+  const MIN_AD_WAIT_MS = 5000;
+  if (elapsedMs < MIN_AD_WAIT_MS) {
+    const remaining = Math.ceil((MIN_AD_WAIT_MS - elapsedMs) / 1000);
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: cb.id,
-      text: `⏳ Please watch the ad for 5 seconds! (${remaining}s remaining)\nකරුණාකර තවත් තත්පර ${remaining}ක් Ad එක නරඹා නැවත උත්සාහ කරන්න.`,
+      text: `⏳ තවත් තත්පර ${remaining}ක් රැඳී සිටින්න.`,
       show_alert: true,
     });
     return;
   }
+
+  // Record verification only after a start timestamp and minimum wait pass.
+  await env.DB.prepare("UPDATE users SET ad_verified = 1 WHERE user_id = ? AND ad_started_at = ?")
+    .bind(chatId, adStartedAt).run();
 
   await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
     callback_query_id: cb.id,
@@ -1142,9 +1147,17 @@ async function handleAdVerification(env, chatId, cb) {
 
   // Check if user is VIP (VIP files are never auto-deleted)
   const isVip = await arePaidPlansEnabled(env) && isUserVipActive(user);
+  if (!idsToSend.length) {
+    await sendReply(env, chatId, "❌ මෙම download session එකේ files හමු වුණේ නැහැ. කරුණාකර අලුත් download link එකක් විවෘත කරන්න.");
+    return;
+  }
+
   const results = await sendBatchFiles(env, chatId, idsToSend, isVip);
-  if (idsToSend.length > 0 && results.length === idsToSend.length && results.every((r) => r?.ok)) {
+  if (results.length === idsToSend.length && results.every((r) => r?.ok)) {
     await env.DB.prepare("UPDATE users SET delivered = 1 WHERE user_id = ?").bind(chatId).run();
+  } else {
+    console.error("Ad-verified file delivery incomplete", { userId: chatId, expected: idsToSend.length, sent: results.filter((r) => r?.ok).length });
+    await sendReply(env, chatId, "⚠️ Ad verification සාර්ථකයි, නමුත් සමහර files යැවීමට නොහැකි වුණා. පහත 'I have watched ad' button එක නැවත ඔබලා retry කරන්න. ගැටලුව දිගටම තිබුණොත් admin ට දන්වන්න.");
   }
 }
 
@@ -1212,72 +1225,9 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
 
     const now = Date.now();
 
-    // 🛑 FREE TIER DAILY DOWNLOAD QUOTA ENFORCEMENT (If enabled, maxDaily > 0)
-    const maxDaily = parseInt(env.FREE_DAILY_LIMIT || "0", 10);
-    let dailyDownloads = user?.daily_downloads || 0;
-    let quotaResetAt = user?.quota_reset_at || 0;
-
-    if (maxDaily > 0) {
-      // Reset daily quota if 24-hour cycle has passed
-      if (!quotaResetAt || now >= quotaResetAt) {
-        dailyDownloads = 0;
-        quotaResetAt = now + 24 * 60 * 60 * 1000;
-        await env.DB.prepare(`
-          UPDATE users SET daily_downloads = 0, quota_reset_at = ? WHERE user_id = ?
-        `).bind(quotaResetAt, chatId).run();
-      }
-
-      if (dailyDownloads >= maxDaily) {
-        const remainingMs = Math.max(0, quotaResetAt - now);
-        const resetHours = Math.ceil(remainingMs / (60 * 60 * 1000));
-
-        const quotaKeyboard = {
-          inline_keyboard: [
-            [{ text: "🗓️ Weekly Pass (Rs. 100 / 7d)", callback_data: "vip_plan_weekly" }],
-            [{ text: "🗓️ Monthly Pass (Rs. 300 / 30d)", callback_data: "vip_plan_monthly" }],
-            [{ text: "👑 Lifetime VIP (Rs. 2500)", callback_data: "vip_plan_lifetime" }],
-            [{ text: "⭐️ Unlock with Telegram Stars", callback_data: "vip_stars_menu" }],
-          ],
-        };
-
-        const titleDisplay = movieTitle ? `🎬 <b>${escapeHtml(movieTitle)}</b>\n` : "";
-        await callTelegram(env.BOT_TOKEN, "sendMessage", {
-          chat_id: chatId,
-          parse_mode: "HTML",
-          text: `🛑 <b>Daily Free Download Limit Reached! (${dailyDownloads}/${maxDaily})</b>\n━━━━━━━━━━━━━━━━━━━━\n${titleDisplay}ඔබ අද දිනට හිමි නොමිලේ Download Limit එක (Files ${maxDaily}) සම්පූර්ණ කර ඇත.\n\n⏰ <b>Quota Reset:</b> තවත් පැය <b>${resetHours}කින්</b> නොමිලේ Downloads නැවත ලැබෙනු ඇත.\n\n👑 <b>ලිමිට් නැතිව දැන්ම දිගටම බලන්න:</b>\nWeekly (Rs. 100) හෝ Monthly (Rs. 300) VIP ලබාගෙන Unlimited Downloads ලබාගන්න!`,
-          reply_markup: quotaKeyboard,
-        });
-        return;
-      }
-    }
-
-    // 🕐 COOLDOWN CHECK for Free Users (5 minutes between downloads)
-    const COOLDOWN_MS = 5 * 60 * 1000;
-    const lastDownload = user?.last_download_at || 0;
-    const timePassed = now - lastDownload;
-
-    if (lastDownload > 0 && timePassed < COOLDOWN_MS) {
-      const remainingMs = COOLDOWN_MS - timePassed;
-      const remainingMins = Math.floor(remainingMs / 60000);
-      const remainingSecs = Math.ceil((remainingMs % 60000) / 1000);
-
-      const cooldownKeyboard = {
-        inline_keyboard: [
-          [{ text: `⏳ Wait ${remainingMins}m ${remainingSecs}s (Free Limit)`, callback_data: `refresh_cooldown_${payload}` }],
-          [{ text: "⚡ Skip Cooldown with 5 Stars (Instant)", callback_data: `buy_fast_pass_${payload}` }],
-          [{ text: "👑 Get VIP (No Limits, Forever)", callback_data: "vip_pay_bank" }],
-        ],
-      };
-
-      const titleDisplay = movieTitle ? `🎬 <b>${escapeHtml(movieTitle)}</b>\n` : "";
-      await callTelegram(env.BOT_TOKEN, "sendMessage", {
-        chat_id: chatId,
-        parse_mode: "HTML",
-        text: `⏳ <b>Free Download Cooldown Active!</b>\n━━━━━━━━━━━━━━━━━━━━\n${titleDisplay}ඔබ මීට සුළු මොහොතකට පෙර Download එකක් ලබාගත්තා.\n\n⏰ <b>Cooldown:</b> තවත් <b>${remainingMins} minutes ${remainingSecs} seconds</b> රැඳී සිටින්න.\n\n💡 <b>ඉක්මනින් ගන්නද?</b>\n⚡ ⭐️ 5 Stars ගෙවා Cooldown Skip කරන්න.\n👑 VIP ලබාගෙන Unlimited Downloads!\n━━━━━━━━━━━━━━━━━━━━`,
-        reply_markup: cooldownKeyboard,
-      });
-      return;
-    }
+    // Free users can download the full batch after completing the ad; no daily quota or cooldown.
+    const maxDaily = 0;
+    const dailyDownloads = 0;
 
     // Display Rich Preview & Choice Card with Secret Token embedded in verify URL
     const websiteUrl = env.WEBSITE_URL || "https://pixelpoplk.pages.dev";
@@ -1290,13 +1240,14 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
       inline_keyboard: [
         [{ text: "🎬 Watch Ad (Free / නොමිලේ)", url: adUrl }],
         [{ text: "✅ I have watched ad ⁉️ / බැලුවා", callback_data: "check_ad" }],
-        [{ text: "⚡ Skip Ad with 5 Stars (Instant)", callback_data: `buy_fast_pass_${payload}` }],
-        [{ text: "👑 Get VIP (Weekly / Monthly / Lifetime)", callback_data: "vip_pay_bank" }],
+        ...(paidPlansEnabled ? [
+          [{ text: "⚡ Skip Ad with 5 Stars (Instant)", callback_data: `buy_fast_pass_${payload}` }],
+          [{ text: "👑 Get VIP (Weekly / Monthly / Lifetime)", callback_data: "vip_pay_bank" }],
+        ] : []),
       ],
     };
 
-    const quotaStatus = maxDaily > 0 ? `📊 <b>Today's Free Downloads:</b> ${dailyDownloads} / ${maxDaily}\n` : "";
-    const previewMsg = `🍿 <b>PixelPop File Ready for Download:</b>\n━━━━━━━━━━━━━━━━━━━━\n${titleDisplay}📁 <b>Total Files:</b> ${fileCount} File(s)\n${quotaStatus}⚡ <b>Instant Access:</b> Pay 5 Stars to download without ads.\n🆓 <b>Free Access:</b> Click 'Watch Ad', stay 5s, and tap 'I have watched ad'.\n━━━━━━━━━━━━━━━━━━━━`;
+    const previewMsg = `🍿 <b>PixelPop File Ready for Download:</b>\n━━━━━━━━━━━━━━━━━━━━\n${titleDisplay}📁 <b>Total Files:</b> ${fileCount} File(s)\n🆓 <b>Free Access:</b> Click 'Watch Ad', complete the sponsor verification, and tap 'I have watched ad'.\n${paidPlansEnabled ? "⚡ <b>Instant Access:</b> 5 Stars or VIP plans are also available.\n" : ""}━━━━━━━━━━━━━━━━━━━━`;
 
     let sentPhoto = false;
     if (posterUrl && previewMsg.length <= 950) {
@@ -2701,6 +2652,7 @@ async function editTelegramMessage(env, cb, textOrCaption, replyMarkup) {
   if (!msg) return;
   const chatId = msg.chat.id.toString();
   const messageId = msg.message_id;
+  const shownText = textOrCaption;
 
   if (msg.photo && msg.photo.length > 0) {
     const res = await callTelegram(env.BOT_TOKEN, "editMessageCaption", {
@@ -2734,7 +2686,7 @@ async function sendSearchReply(env, chatId, poster, textOrCaption, inlineKeyboar
     const payload = {
       chat_id: chatId,
       photo: poster,
-      caption: textOrCaption,
+      caption: shownText,
       parse_mode: "HTML",
       reply_markup: keyboardObj,
     };
@@ -2745,7 +2697,7 @@ async function sendSearchReply(env, chatId, poster, textOrCaption, inlineKeyboar
 
   const payload = {
     chat_id: chatId,
-    text: textOrCaption,
+    text: shownText,
     parse_mode: "HTML",
     reply_markup: keyboardObj,
   };
@@ -2854,12 +2806,13 @@ async function handleConfirmMovieDownload(env, cb, chosenToken, rootToken) {
 
   const caption = `🎬 <b>${escapeHtml(rootTitle)}</b>${yearStr} [${qualObj.raw}${extraBadges}]\n━━━━━━━━━━━━━━━━━━━━\n📥 <b>File Ready for Download!</b>\n\n👉 පහත <b>'⚡ Download ⚡'</b> Button එක ඔබන්න.\n👉 එවිට Bot Private Chat එක Open වේ. එතන Ad එක නරඹා File එක ලබාගන්න.\n━━━━━━━━━━━━━━━━━━━━\n<i>🛡️ Content Protected: Permanent Storage</i>`;
 
+  const paidPlansEnabled = await arePaidPlansEnabled(env);
   const kb = {
     inline_keyboard: [
       [{ text: `⚡ Download (${qualObj.raw}) ⚡`, url: startUrl }],
       [{ text: "▶️ Watch Trailer / ට්‍රේලර් බලන්න", url: trailerUrl }],
       [{ text: "↩️ Back to Qualities / ආපසු", callback_data: `br_mov_${rootToken}` }],
-      [{ text: "👑 Get VIP (Zero Ads / Unlimited)", callback_data: "vip_pay_bank" }],
+      ...(paidPlansEnabled ? [[{ text: "👑 Get VIP (Zero Ads / Unlimited)", callback_data: "vip_pay_bank" }]] : []),
     ],
   };
 
@@ -3643,9 +3596,9 @@ async function sendReply(env, chatId, htmlText) {
 }
 
 function hidePaidStatusText(value) {
-  const blocked = /VIP|paid|membership|Telegram Stars|\\bStars\\b|LKR\\s*\\d|Rs\\.\\s*\\d|bank slip|Bank of Ceylon|zero ads|no cooldown|lifetime/i;
-  const kept = String(value || "").split("\\n").filter(line => !blocked.test(line));
-  const result = kept.join("\\n").replace(/\\n{3,}/g, "\\n\\n").trim();
+  const blocked = /VIP|paid|membership|Telegram Stars|\bStars\b|LKR\s*\d|Rs\.\s*\d|bank slip|Bank of Ceylon|zero ads|no cooldown|lifetime/i;
+  const kept = String(value || "").split(/\r?\n/).filter(line => !blocked.test(line));
+  const result = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
   return result || "📢 දැනට සාමාන්‍ය Free Download ක්‍රමය භාවිතා කරන්න. Ad එක බලලා file එක ලබාගන්න.";
 }
 
@@ -3657,10 +3610,30 @@ function escapeHtml(text) {
 }
 
 async function callTelegram(token, method, body) {
+  let bodyToSend = body;
+  const messageMethods = new Set(["sendMessage", "sendPhoto", "editMessageText", "editMessageCaption"]);
+  const chatId = body?.chat_id == null ? "" : body.chat_id.toString();
+
+  // Enforce Paid Plans OFF consistently across every user-facing card, not just search results.
+  if (messageMethods.has(method) && chatId && !isAuthorizedAdmin(chatId, env) && !(await arePaidPlansEnabled(env))) {
+    bodyToSend = { ...body };
+    if (typeof bodyToSend.text === "string") bodyToSend.text = hidePaidStatusText(bodyToSend.text);
+    if (typeof bodyToSend.caption === "string") bodyToSend.caption = hidePaidStatusText(bodyToSend.caption);
+    if (bodyToSend.reply_markup?.inline_keyboard) {
+      const paidButtonPattern = /vip|paid|stars|bank|fast.?pass|telegram stars|membership|lifetime|weekly pass|monthly pass/i;
+      bodyToSend.reply_markup = {
+        ...bodyToSend.reply_markup,
+        inline_keyboard: bodyToSend.reply_markup.inline_keyboard
+          .map((row) => row.filter((button) => !paidButtonPattern.test(String(button.text || "") + " " + String(button.callback_data || "") + " " + String(button.url || "")))
+          .filter((row) => row.length > 0),
+      };
+    }
+  }
+
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(bodyToSend),
   });
   return res.json();
 }
