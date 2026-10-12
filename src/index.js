@@ -61,7 +61,7 @@ function isAuthorizedAdmin(userId, env) {
 }
 
 async function isUserBanned(env, userId) {
-  if (!env.DB || !userId) return false;
+  if (!env.DB || !userId) return true;
   try {
     const u = await env.DB.prepare(`SELECT is_banned FROM users WHERE user_id = ?`).bind(userId.toString()).first();
     return u?.is_banned === 1;
@@ -94,17 +94,13 @@ export default {
       await ensureSchema(env);
     }
 
-    // 🔍 1. SYSTEM DIAGNOSTIC TEST (Protected by Admin ID or Secret)
+    // Diagnostic endpoint uses a dedicated secret and never reveals it.
     if (url.pathname === "/test") {
       const secret = url.searchParams.get("secret");
-      if (secret !== env.ADMIN_ID) {
-        return new Response(
-          JSON.stringify({ error: "Unauthorized access. Pass ?secret=" + (env.ADMIN_ID || "YOUR_ADMIN_ID") }),
-          {
-            status: 401,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
+      if (!env.DIAGNOSTIC_SECRET || secret !== env.DIAGNOSTIC_SECRET) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
       }
 
       const botInfo = await callTelegram(env.BOT_TOKEN, "getMe", {});
@@ -198,12 +194,10 @@ export default {
 
     // 3. TELEGRAM WEBHOOK
     if (request.method === "POST") {
-      // Optional Secret Token verification
-      if (env.BOT_SECRET_TOKEN) {
-        const headerSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-        if (headerSecret !== env.BOT_SECRET_TOKEN) {
-          return new Response("Unauthorized", { status: 403 });
-        }
+      // Fail closed: a webhook secret must exist and match Telegram's header.
+      const headerSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+      if (!env.BOT_SECRET_TOKEN || headerSecret !== env.BOT_SECRET_TOKEN) {
+        return new Response("Unauthorized", { status: 403 });
       }
 
       try {
@@ -723,6 +717,13 @@ async function handleCallbackQuery(cb, env) {
   const chatId = cb.from.id.toString();
   const data = cb.data || "";
 
+  if (!isAuthorizedAdmin(chatId, env) && await isUserBanned(env, chatId)) {
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+      callback_query_id: cb.id, text: "⛔ Account suspended.", show_alert: true,
+    });
+    return;
+  }
+
   // 1. Language Toggle
   if (data === "set_lang_si" || data === "set_lang_en") {
     const newLang = data === "set_lang_si" ? "si" : "en";
@@ -747,6 +748,18 @@ async function handleCallbackQuery(cb, env) {
   if (data.startsWith("adm_")) {
     await handleAdminPanelCallback(cb, env);
     return;
+  }
+
+  if (data.startsWith("buy_fast_pass_") || data.startsWith("buy_vip_stars_") ||
+      data === "vip_stars_menu" || data === "vip_plan_weekly" ||
+      data === "vip_plan_monthly" || data === "vip_plan_lifetime" || data === "vip_pay_bank") {
+    if (!(await arePaidPlansEnabled(env))) {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+        callback_query_id: cb.id, text: "Paid plans OFF. Watch the ad for a free download.", show_alert: true,
+      });
+      await sendReply(env, chatId, "📢 Paid Plans OFF. Ad එක බලලා සාමාන්‍ය විදිහට file එක ගන්න.");
+      return;
+    }
   }
 
   // 2. Admin Done / Cancel
@@ -1149,8 +1162,8 @@ async function initiateFileSession(env, chatId, payload) {
     let movieTitle = null;
     let posterUrl = null;
 
-    // A. Check modern secure UUID batch token (b_xxxxxxxx)
-    if (payload.startsWith("b_")) {
+    // Only database-issued batch tokens are allowed; legacy Base64 ID lists are disabled.
+    if (/^b_[a-f0-9-]{8,40}$/i.test(payload)) {
       const batch = await env.DB.prepare(`
         SELECT * FROM batches WHERE token = ?
       `).bind(payload).first();
@@ -1162,20 +1175,7 @@ async function initiateFileSession(env, chatId, payload) {
       movieTitle = batch.title;
       posterUrl = batch.poster_url || null;
     } else {
-      // B. Backward compatibility for legacy Base64 links
-      const rawCode = atob(payload);
-      if (rawCode.startsWith("get-")) {
-        const match = rawCode.match(/^get-(\d+)-(\d+)$/);
-        if (!match) throw new Error("Invalid range");
-        const start = parseInt(match[1]);
-        const end = parseInt(match[2]);
-        for (let i = start; i <= end; i++) targetMsgIds.push(i);
-      } else if (rawCode.startsWith("list-")) {
-        const listStr = rawCode.replace("list-", "");
-        targetMsgIds = listStr.split(",").map((id) => parseInt(id));
-      } else {
-        throw new Error("Unknown format");
-      }
+      throw new Error("Invalid or unsupported download token");
     }
 
     // Save target session in D1 + generate fresh secret verification token with TTL timestamp
@@ -1196,7 +1196,8 @@ async function initiateFileSession(env, chatId, payload) {
 
     // Check if user has active VIP (no cooldown, no daily limits, no ads)
     const user = await env.DB.prepare(`SELECT * FROM users WHERE user_id = ?`).bind(chatId).first();
-    if (isUserVipActive(user)) {
+    const paidPlansEnabled = await arePaidPlansEnabled(env);
+    if (paidPlansEnabled && isUserVipActive(user)) {
       await sendReply(
         env,
         chatId,
@@ -1492,6 +1493,10 @@ async function handleScheduledTasks(env) {
 
 // ================= TELEGRAM STARS (XTR) PAYMENTS =================
 async function sendStarsInvoice(env, chatId, { title, description, payload, starsAmount }) {
+  if (!(await arePaidPlansEnabled(env))) {
+    await sendReply(env, chatId, "📢 Paid Plans OFF. Ad එක බලලා file එක ගන්න.");
+    return;
+  }
   await callTelegram(env.BOT_TOKEN, "sendInvoice", {
     chat_id: chatId,
     title: title,
@@ -1503,24 +1508,41 @@ async function sendStarsInvoice(env, chatId, { title, description, payload, star
 }
 
 async function handlePreCheckoutQuery(query, env) {
-  // Always approve valid invoices
+  const payload = query.invoice_payload || "";
+  const amounts = { vip_stars_7d: 20, vip_30d: 60, vip_stars_30d: 60, vip_stars_lifetime: 500 };
+  const expected = payload.startsWith("fast_pass_b_") ? 5 : amounts[payload];
+  const valid = await arePaidPlansEnabled(env) && Number.isInteger(expected) &&
+    query.currency === "XTR" && query.total_amount === expected;
   await callTelegram(env.BOT_TOKEN, "answerPreCheckoutQuery", {
-    pre_checkout_query_id: query.id,
-    ok: true,
+    pre_checkout_query_id: query.id, ok: valid,
+    ...(valid ? {} : { error_message: "Paid plans are off or invoice details are invalid. Use the ad-supported download." }),
   });
 }
 
 async function handleSuccessfulPayment(msg, env) {
   const chatId = msg.chat.id.toString();
   const payment = msg.successful_payment;
-  const payload = payment.invoice_payload;
+  const payload = payment.invoice_payload || "";
   const amount = payment.total_amount;
-
-  // Log in payments table
+  const chargeId = payment.telegram_payment_charge_id;
+  const prior = await env.DB.prepare("SELECT id FROM payments WHERE telegram_charge_id = ? LIMIT 1").bind(chargeId).first();
+  if (prior) return;
+  if (!(await arePaidPlansEnabled(env))) {
+    try { await callTelegram(env.BOT_TOKEN, "refundStarPayment", { user_id: Number(chatId), telegram_payment_charge_id: chargeId }); }
+    catch (err) { console.error("Stars refund failed:", err); }
+    await sendReply(env, chatId, "Paid Plans OFF. Refund request යොමු කළා; Telegram payment history පරීක්ෂා කරන්න.");
+    return;
+  }
+  const amounts = { vip_stars_7d: 20, vip_30d: 60, vip_stars_30d: 60, vip_stars_lifetime: 500 };
+  const expected = payload.startsWith("fast_pass_b_") ? 5 : amounts[payload];
+  if (payment.currency !== "XTR" || !Number.isInteger(expected) || amount !== expected) {
+    console.error("Invalid payment payload/amount/currency:", payload, amount, payment.currency);
+    return;
+  }
   await env.DB.prepare(`
     INSERT INTO payments (user_id, type, amount, currency, telegram_charge_id, created_at)
     VALUES (?, ?, ?, 'XTR', ?, ?)
-  `).bind(chatId, payload, amount, payment.telegram_payment_charge_id, Date.now()).run();
+  `).bind(chatId, payload, amount, chargeId, Date.now()).run();
 
   if (payload.startsWith("fast_pass_")) {
     const batchPayload = payload.replace("fast_pass_", "");
@@ -1562,8 +1584,9 @@ async function handleSuccessfulPayment(msg, env) {
 
 // ================= LOCAL VIP & BOC BANK SLIP SYSTEM =================
 async function sendVipInfoCard(env, chatId) {
+  const paidEnabled = await arePaidPlansEnabled(env);
   const keyboard = {
-    inline_keyboard: [
+    inline_keyboard: paidEnabled ? [
       [
         { text: "🗓️ Weekly (Rs. 100)", callback_data: "vip_plan_weekly" },
         { text: "🗓️ Monthly (Rs. 300)", callback_data: "vip_plan_monthly" },
@@ -1571,8 +1594,12 @@ async function sendVipInfoCard(env, chatId) {
       [{ text: "👑 Lifetime VIP Pass (Rs. 2500)", callback_data: "vip_plan_lifetime" }],
       [{ text: "⭐️ Pay with Telegram Stars (XTR)", callback_data: "vip_stars_menu" }],
       [{ text: "🏛️ Bank of Ceylon (BOC Details)", callback_data: "vip_pay_bank" }],
-    ],
+    ] : [],
   };
+  if (!paidEnabled) {
+    await sendReply(env, chatId, "📢 <b>Paid Plans දැනට OFF.</b>\nAd එක බලලා සාමාන්‍ය විදිහට files ලබාගන්න.");
+    return;
+  }
 
   const text = `👑 <b>PixelPop VIP Membership Club</b>\n━━━━━━━━━━━━━━━━━━━━\n🌟 <b>VIP විශේෂ වරප්‍රසාද:</b>\n• 🚫 <b>Zero Ads:</b> කිසිදු Sponsor Ad එකක් නැත\n• ⏳ <b>No Cooldown:</b> ලිමිට් නැතිව එක දිගට Downloads\n• 🛡️ <b>Permanent:</b> Files පැය 6කින් මැකී යන්නේ නැත\n• ⚡ <b>Complete Seasons:</b> 1-Click Instant Downloads\n\n💎 <b>පැකේජ මිල ගණන් (Flexible VIP Plans):</b>\n• 🗓️ <b>Weekly Pass (දින 7):</b> LKR 100/= (හෝ ⭐️ 20 Stars)\n• 🗓️ <b>Monthly Pass (දින 30):</b> LKR 300/= (හෝ ⭐️ 60 Stars)\n• 👑 <b>Lifetime VIP (සදාකාලික):</b> LKR 2500/= (හෝ ⭐️ 500 Stars)\n━━━━━━━━━━━━━━━━━━━━\nගෙවීම් සිදු කිරීමට පහත Button එකක් තෝරන්න:`;
 
@@ -2014,6 +2041,9 @@ async function sendAdminDashboard(env, chatId, editCb = null) {
         { text: "🔄 Refresh", callback_data: "adm_refresh" },
       ],
       [
+        { text: (await arePaidPlansEnabled(env)) ? "🟢 Paid Plans ON — turn OFF" : "🔴 Paid Plans OFF — turn ON", callback_data: "adm_toggle_paid" },
+      ],
+      [
         { text: "❌ Close Panel", callback_data: "adm_close" },
       ],
     ],
@@ -2046,6 +2076,22 @@ async function handleAdminPanelCallback(cb, env) {
   }
 
   if (data === "adm_panel" || data === "adm_refresh") {
+    await sendAdminDashboard(env, chatId, cb);
+    return;
+  }
+
+  if (data === "adm_toggle_paid") {
+    const nextEnabled = !(await arePaidPlansEnabled(env));
+    await env.DB.prepare(`
+      INSERT INTO bot_settings (setting_key, setting_value) VALUES ('paid_plans_enabled', ?)
+      ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value
+    `).bind(nextEnabled ? "1" : "0").run();
+    if (!nextEnabled) {
+      await env.DB.prepare("UPDATE users SET is_vip = 0, vip_until = 0 WHERE is_vip != 0 OR vip_until != 0").run();
+    }
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+      callback_query_id: cb.id, text: nextEnabled ? "Paid plans ON" : "Paid plans OFF; all VIP disabled", show_alert: true,
+    });
     await sendAdminDashboard(env, chatId, cb);
     return;
   }
@@ -3365,9 +3411,17 @@ async function handleMovieRequest(env, chatId, userName, query) {
 }
 
 // ================= GENERAL HELPERS =================
+async function arePaidPlansEnabled(env) {
+  if (!env.DB) return false;
+  try {
+    const row = await env.DB.prepare("SELECT setting_value FROM bot_settings WHERE setting_key = 'paid_plans_enabled'").first();
+    return row ? row.setting_value === "1" : true;
+  } catch { return false; }
+}
+
 function isUserVipActive(user) {
   if (!user) return false;
-  return user.is_vip === 1 && (user.vip_until || 0) > Date.now();
+  return Number(user.is_vip) === 1 && Number(user.vip_until || 0) > Date.now();
 }
 
 async function getUserLang(env, chatId) {
@@ -3390,11 +3444,12 @@ async function checkUserSubscription(env, userId) {
       user_id: userId,
     });
 
-    if (!res.ok) return true;
+    if (!res.ok) return false;
     const status = res.result?.status;
-    return ["creator", "administrator", "member", "restricted"].includes(status);
+    if (status === "restricted") return res.result?.is_member === true;
+    return ["creator", "administrator", "member"].includes(status);
   } catch {
-    return true;
+    return false;
   }
 }
 
@@ -3437,6 +3492,13 @@ async function ensureUserExists(env, user) {
 async function ensureSchema(env) {
   if (!env.DB || isSchemaMigrated) return;
   try {
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS bot_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT NOT NULL
+      )
+    `).run();
+
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS users (
         user_id TEXT PRIMARY KEY,
