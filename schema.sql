@@ -1,3 +1,9 @@
+-- Runtime feature switches (owner-controlled settings)
+CREATE TABLE IF NOT EXISTS bot_settings (
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT NOT NULL
+);
+
 -- ==========================================
 -- PixelPop Telegram Bot Database Schema (D1)
 -- ==========================================
