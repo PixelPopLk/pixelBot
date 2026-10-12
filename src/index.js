@@ -139,57 +139,57 @@ export default {
       );
     }
 
-    // 🛡️ 2. AD CLICK & VERIFICATION RECORD (Strict Cryptographic Token-Only Anti-Bypass)
+    // AD SESSION: starting an ad must NEVER mark it as completed.
     if (url.pathname === "/verify" || url.pathname === "/verify_ad" || url.pathname === "/ad_started") {
       const userId = url.searchParams.get("u") || url.searchParams.get("a");
       const token = url.searchParams.get("t");
+      const jsonHeaders = { ...corsHeaders, "Content-Type": "application/json", "Cache-Control": "no-store" };
 
       if (!userId || !token) {
-        return new Response(
-          JSON.stringify({ ok: false, error: "Access denied. Valid user ID and secret token are required." }),
-          {
-            status: 400,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      if (env.DB) {
-        const user = await env.DB.prepare(`
-          SELECT verify_token, token_created_at FROM users WHERE user_id = ?
-        `).bind(userId.toString()).first();
-
-        if (!user || !user.verify_token || user.verify_token !== token) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "Invalid or expired verification token." }),
-            {
-              status: 400,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
-
-        // Token TTL Check (15-Minute Expiry Limit)
-        const TOKEN_TTL_MS = 15 * 60 * 1000;
-        if (user.token_created_at && (Date.now() - user.token_created_at > TOKEN_TTL_MS)) {
-          return new Response(
-            JSON.stringify({ ok: false, error: "Verification token expired (15-minute limit exceeded). Please re-open the link from the bot." }),
-            {
-              status: 400,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
-
-        await env.DB.prepare(`
-          UPDATE users SET ad_verified = 1, ad_started_at = ? WHERE user_id = ?
-        `).bind(Date.now(), userId.toString()).run();
-
-        return new Response(JSON.stringify({ ok: true, status: "verified" }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        return new Response(JSON.stringify({ ok: false, error: "User ID and verification token are required." }), {
+          status: 400, headers: jsonHeaders,
         });
       }
-      return new Response("OK", { headers: corsHeaders });
+      if (!env.DB) {
+        return new Response(JSON.stringify({ ok: false, error: "Verification database unavailable." }), {
+          status: 503, headers: jsonHeaders,
+        });
+      }
+
+      const user = await env.DB.prepare(`
+        SELECT verify_token, token_created_at, ad_started_at FROM users WHERE user_id = ?
+      `).bind(userId.toString()).first();
+
+      if (!user || !user.verify_token || user.verify_token !== token) {
+        return new Response(JSON.stringify({ ok: false, error: "Invalid verification token." }), {
+          status: 400, headers: jsonHeaders,
+        });
+      }
+
+      const now = Date.now();
+      const TOKEN_TTL_MS = 15 * 60 * 1000;
+      if (!user.token_created_at || now - Number(user.token_created_at) > TOKEN_TTL_MS || now < Number(user.token_created_at)) {
+        return new Response(JSON.stringify({ ok: false, error: "Verification link expired. Request a fresh download link from the bot." }), {
+          status: 400, headers: jsonHeaders,
+        });
+      }
+
+      if (url.pathname === "/ad_started") {
+        // Idempotent start timestamp: repeated page loads cannot reset the timer.
+        if (!user.ad_started_at) {
+          await env.DB.prepare(`
+            UPDATE users SET ad_started_at = ?, ad_verified = 0 WHERE user_id = ? AND verify_token = ?
+          `).bind(now, userId.toString(), token).run();
+        }
+        return new Response(JSON.stringify({ ok: true, status: "ad_started" }), { headers: jsonHeaders });
+      }
+
+      // No trusted ad-provider completion callback is configured. Do not let
+      // a browser request claim that the ad was completed.
+      return new Response(JSON.stringify({
+        ok: false,
+        error: "Ad completion cannot be confirmed by this endpoint. Return to the bot after the ad and use the verification button."
+      }), { status: 403, headers: jsonHeaders });
     }
 
     // 3. TELEGRAM WEBHOOK
@@ -1104,15 +1104,33 @@ async function handleAdVerification(env, chatId, cb) {
     return;
   }
 
-  // Only accept a successful verification recorded by the website's secret-token endpoint.
-  if (Number(user.ad_verified) !== 1) {
+  // Require an ad-start record and a minimum elapsed time. This is only a
+  // basic anti-instant-bypass heuristic, not proof of provider completion.
+  const adStartedAt = Number(user.ad_started_at || 0);
+  if (!adStartedAt) {
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: cb.id,
-      text: "❌ You haven't completed the sponsor ad on the website yet!\nඔබ තවමත් Sponsor Ad එක සම්පූර්ණ කර නැත!",
+      text: "❌ මුලින් Watch Ad බොත්තම ඔබලා ad එක විවෘත කරන්න.",
       show_alert: true,
     });
     return;
   }
+
+  const elapsedMs = Date.now() - adStartedAt;
+  const MIN_AD_WAIT_MS = 5000;
+  if (elapsedMs < MIN_AD_WAIT_MS) {
+    const remaining = Math.ceil((MIN_AD_WAIT_MS - elapsedMs) / 1000);
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+      callback_query_id: cb.id,
+      text: `⏳ තවත් තත්පර ${remaining}ක් රැඳී සිටින්න.`,
+      show_alert: true,
+    });
+    return;
+  }
+
+  // Record verification only after a start timestamp and minimum wait pass.
+  await env.DB.prepare("UPDATE users SET ad_verified = 1 WHERE user_id = ? AND ad_started_at = ?")
+    .bind(chatId, adStartedAt).run();
 
   await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
     callback_query_id: cb.id,
