@@ -1914,7 +1914,7 @@ async function generateBatchLink(env, chatId) {
   const paidPlansEnabled = await arePaidPlansEnabled(env);
 
   // 🎬 TMDb Auto Poster & Metadata Lookup
-  const tmdb = await fetchTmdbInfo(env, title);
+  const tmdb = await fetchTmdbInfo(env, title, { adminProvidedTitle: true });
   const posterUrl = tmdb?.poster || null;
   const displayTitle = tmdb?.title || title;
   const yearText = tmdb?.year ? ` (${tmdb.year})` : "";
@@ -2643,10 +2643,12 @@ function tmdbLinkSearchTitle(value) {
   return parsed?.slug ? decodeURIComponent(parsed.slug).replace(/[-_]+/g, " ").trim() : "";
 }
 
-async function fetchTmdbInfo(env, query) {
+async function fetchTmdbInfo(env, query, options = {}) {
   if (!env.TMDB_API_KEY) return null;
   const tmdbLink = parseTmdbLink(query);
-  if (!tmdbLink && !(await isTmdbTitleSearchEnabled(env))) return null;
+  // When direct name lookup is disabled, still allow TMDb metadata for titles
+  // explicitly supplied by the admin while creating a batch.
+  if (!tmdbLink && !options.adminProvidedTitle && !(await isTmdbTitleSearchEnabled(env))) return null;
 
   const cleanQuery = tmdbLink ? "" : String(query || "")
     .replace(/[\[\(].*?[\]\)]/g, "")
