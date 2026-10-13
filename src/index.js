@@ -14,6 +14,11 @@ let isSchemaMigrated = false;
 
 // 🛡️ High-Performance Sliding Window In-Memory Rate Limiter (Anti-Flood / Anti-DDoS)
 const rateLimitMap = new Map();
+let tmdbTitleSearchCacheValue = null;
+let tmdbTitleSearchCacheUntil = 0;
+const tmdbResultCache = new Map();
+const TMDB_SETTINGS_CACHE_MS = 30_000;
+const TMDB_RESULT_CACHE_MS = 10 * 60 * 1000;
 
 function isRateLimited(userId, limit = 25, windowMs = 60000, minIntervalMs = 700) {
   if (!userId) return false;
@@ -89,11 +94,6 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Optimize D1: Only ensure schema once per worker isolate lifecycle
-    if (!isSchemaMigrated) {
-      await ensureSchema(env);
-    }
-
     // Diagnostic endpoint uses a dedicated secret and never reveals it.
     if (url.pathname === "/test") {
       const secret = url.searchParams.get("secret");
@@ -139,7 +139,7 @@ export default {
       );
     }
 
-    // AD SESSION: starting an ad must NEVER mark it as completed.
+    // AD SESSION: create a start timestamp, then automatically deliver after the 5-second minimum wait.
     if (url.pathname === "/verify" || url.pathname === "/verify_ad" || url.pathname === "/ad_started") {
       const userId = url.searchParams.get("u") || url.searchParams.get("a");
       const token = url.searchParams.get("t");
@@ -157,7 +157,8 @@ export default {
       }
 
       const user = await env.DB.prepare(`
-        SELECT verify_token, token_created_at, ad_started_at FROM users WHERE user_id = ?
+        SELECT verify_token, token_created_at, ad_started_at, ad_verified, delivered, msg_ids
+        FROM users WHERE user_id = ?
       `).bind(userId.toString()).first();
 
       if (!user || !user.verify_token || user.verify_token !== token) {
@@ -175,7 +176,7 @@ export default {
       }
 
       if (url.pathname === "/ad_started") {
-        // Idempotent start timestamp: repeated page loads cannot reset the timer.
+        // Idempotent start timestamp: reloading the page cannot reset the timer.
         if (!user.ad_started_at) {
           await env.DB.prepare(`
             UPDATE users SET ad_started_at = ?, ad_verified = 0 WHERE user_id = ? AND verify_token = ?
@@ -184,12 +185,80 @@ export default {
         return new Response(JSON.stringify({ ok: true, status: "ad_started" }), { headers: jsonHeaders });
       }
 
-      // No trusted ad-provider completion callback is configured. Do not let
-      // a browser request claim that the ad was completed.
-      return new Response(JSON.stringify({
-        ok: false,
-        error: "Ad completion cannot be confirmed by this endpoint. Return to the bot after the ad and use the verification button."
-      }), { status: 403, headers: jsonHeaders });
+      const adStartedAt = Number(user.ad_started_at || 0);
+      if (!adStartedAt || now < adStartedAt) {
+        return new Response(JSON.stringify({ ok: false, error: "Open the sponsor page again from the bot." }), {
+          status: 409, headers: jsonHeaders,
+        });
+      }
+
+      const MIN_AD_WAIT_MS = 5000;
+      if (now - adStartedAt < MIN_AD_WAIT_MS) {
+        const remaining = Math.ceil((MIN_AD_WAIT_MS - (now - adStartedAt)) / 1000);
+        return new Response(JSON.stringify({ ok: false, status: "waiting", remaining_seconds: remaining }), {
+          status: 425, headers: jsonHeaders,
+        });
+      }
+
+      if (Number(user.delivered) === 1) {
+        return new Response(JSON.stringify({ ok: true, status: "already_delivered" }), { headers: jsonHeaders });
+      }
+
+      // Only one request can claim delivery for this session. Other polls see "processing".
+      if (Number(user.ad_verified) === 1) {
+        return new Response(JSON.stringify({ ok: true, status: "processing" }), { status: 202, headers: jsonHeaders });
+      }
+
+      const claim = await env.DB.prepare(`
+        UPDATE users SET ad_verified = 1
+        WHERE user_id = ? AND verify_token = ? AND ad_started_at = ? AND delivered = 0
+          AND COALESCE(ad_verified, 0) = 0
+      `).bind(userId.toString(), token, adStartedAt).run();
+
+      if (Number(claim?.meta?.changes || 0) !== 1) {
+        const latest = await env.DB.prepare("SELECT delivered, ad_verified FROM users WHERE user_id = ? AND verify_token = ?")
+          .bind(userId.toString(), token).first();
+        if (Number(latest?.delivered) === 1) {
+          return new Response(JSON.stringify({ ok: true, status: "already_delivered" }), { headers: jsonHeaders });
+        }
+        return new Response(JSON.stringify({ ok: true, status: "processing" }), { status: 202, headers: jsonHeaders });
+      }
+
+      let idsToSend = [];
+      try { idsToSend = JSON.parse(user.msg_ids || "[]"); } catch { idsToSend = []; }
+      if (!Array.isArray(idsToSend) || idsToSend.length === 0) {
+        await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ? AND verify_token = ?")
+          .bind(userId.toString(), token).run();
+        return new Response(JSON.stringify({ ok: false, error: "No files were found for this download session." }), {
+          status: 409, headers: jsonHeaders,
+        });
+      }
+
+      try {
+        const results = await sendBatchFiles(env, userId.toString(), idsToSend, false);
+        const allSent = results.length === idsToSend.length && results.every((r) => r?.ok);
+        if (allSent) {
+          await env.DB.prepare("UPDATE users SET delivered = 1, verify_token = NULL WHERE user_id = ? AND ad_started_at = ?")
+            .bind(userId.toString(), adStartedAt).run();
+          return new Response(JSON.stringify({ ok: true, status: "delivered", files_sent: results.length }), { headers: jsonHeaders });
+        }
+
+        await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ? AND verify_token = ?")
+          .bind(userId.toString(), token).run();
+        console.error("Automatic ad delivery incomplete", {
+          userId: userId.toString(), expected: idsToSend.length, sent: results.filter((r) => r?.ok).length,
+        });
+        return new Response(JSON.stringify({ ok: false, error: "Some files could not be sent. Return to the bot and tap retry." }), {
+          status: 502, headers: jsonHeaders,
+        });
+      } catch (err) {
+        await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ? AND verify_token = ?")
+          .bind(userId.toString(), token).run();
+        console.error("Automatic ad delivery error:", err);
+        return new Response(JSON.stringify({ ok: false, error: "Delivery failed. Return to the bot and retry." }), {
+          status: 502, headers: jsonHeaders,
+        });
+      }
     }
 
     // 3. TELEGRAM WEBHOOK
@@ -202,9 +271,19 @@ export default {
 
       try {
         const update = await request.json();
-        await handleTelegramUpdate(update, env);
+        const task = (async () => {
+          if (!isSchemaMigrated) await ensureSchema(env);
+          await handleTelegramUpdate(update, env);
+        })().catch((err) => {
+          console.error("Webhook Error:", err);
+        });
+        if (ctx && typeof ctx.waitUntil === "function") {
+          ctx.waitUntil(task);
+        } else {
+          await task;
+        }
       } catch (err) {
-        console.error("Webhook Error:", err);
+        console.error("Webhook Payload Error:", err);
       }
       return new Response("OK");
     }
@@ -314,7 +393,7 @@ async function handleMessage(msg, env) {
   if (isAdmin) {
     // Master Interactive Admin Control Panel
     if (text === "/admin" || text === "/panel" || text === "/dashboard") {
-      await sendAdminDashboard(env, chatId);
+      await Promise.all([setAdminCommandMenu(env, chatId), sendAdminDashboard(env, chatId)]);
       return;
     }
 
@@ -330,8 +409,8 @@ async function handleMessage(msg, env) {
       const customTitle = text.replace("/add ", "").trim();
       try {
         await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
-      } catch {
-        await env.DB.prepare(`DELETE FROM admin_batch`).run();
+      } catch (err) {
+        console.error("Admin queue clear error:", err);
       }
       await env.DB.prepare(`
         INSERT INTO users (user_id, msg_ids) VALUES ('admin_title_draft', ?)
@@ -771,8 +850,8 @@ async function handleCallbackQuery(cb, env) {
   if (data === "admin_cancel" && isAuthorizedAdmin(chatId, env)) {
     try {
       await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
-    } catch {
-      await env.DB.prepare(`DELETE FROM admin_batch`).run();
+    } catch (err) {
+      console.error("Admin queue clear error:", err);
     }
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: cb.id,
@@ -1103,6 +1182,12 @@ async function handleAdVerification(env, chatId, cb) {
     });
     return;
   }
+  if (Number(user.ad_verified) === 1) {
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+      callback_query_id: cb.id, text: "⏳ Files යවමින් පවතී. මොහොතක් රැඳී සිටින්න.", show_alert: false,
+    });
+    return;
+  }
 
   // Require an ad-start record and a minimum elapsed time. This is only a
   // basic anti-instant-bypass heuristic, not proof of provider completion.
@@ -1128,9 +1213,17 @@ async function handleAdVerification(env, chatId, cb) {
     return;
   }
 
-  // Record verification only after a start timestamp and minimum wait pass.
-  await env.DB.prepare("UPDATE users SET ad_verified = 1 WHERE user_id = ? AND ad_started_at = ?")
-    .bind(chatId, adStartedAt).run();
+  // Claim this delivery so a concurrent auto-verification and manual retry cannot send twice.
+  const claim = await env.DB.prepare(`
+    UPDATE users SET ad_verified = 1
+    WHERE user_id = ? AND ad_started_at = ? AND delivered = 0 AND COALESCE(ad_verified, 0) = 0
+  `).bind(chatId, adStartedAt).run();
+  if (Number(claim?.meta?.changes || 0) !== 1) {
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+      callback_query_id: cb.id, text: "⏳ Files are already being sent.", show_alert: false,
+    });
+    return;
+  }
 
   await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
     callback_query_id: cb.id,
@@ -1156,8 +1249,9 @@ async function handleAdVerification(env, chatId, cb) {
   if (results.length === idsToSend.length && results.every((r) => r?.ok)) {
     await env.DB.prepare("UPDATE users SET delivered = 1 WHERE user_id = ?").bind(chatId).run();
   } else {
+    await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ?").bind(chatId).run();
     console.error("Ad-verified file delivery incomplete", { userId: chatId, expected: idsToSend.length, sent: results.filter((r) => r?.ok).length });
-    await sendReply(env, chatId, "⚠️ Ad verification සාර්ථකයි, නමුත් සමහර files යැවීමට නොහැකි වුණා. පහත 'I have watched ad' button එක නැවත ඔබලා retry කරන්න. ගැටලුව දිගටම තිබුණොත් admin ට දන්වන්න.");
+    await sendReply(env, chatId, "⚠️ සමහර files යැවීමට නොහැකි වුණා. Retry බොත්තම ඔබන්න. ගැටලුව දිගටම තිබුණොත් admin ට දන්වන්න.");
   }
 }
 
@@ -1209,7 +1303,10 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
         chatId,
         `👑 <b>VIP Member Detected!</b>\nBypassing all ads. Delivering your files immediately without expiry limit...`
       );
-      await sendBatchFiles(env, chatId, targetMsgIds, true);
+      const vipResults = await sendBatchFiles(env, chatId, targetMsgIds, true);
+      if (vipResults.length === targetMsgIds.length && vipResults.every((r) => r?.ok)) {
+        await env.DB.prepare("UPDATE users SET delivered = 1, verify_token = NULL WHERE user_id = ?").bind(chatId).run();
+      }
       return;
     }
 
@@ -1239,7 +1336,7 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
     const keyboard = {
       inline_keyboard: [
         [{ text: "🎬 Watch Ad (Free / නොමිලේ)", url: adUrl }],
-        [{ text: "✅ I have watched ad ⁉️ / බැලුවා", callback_data: "check_ad" }],
+        [{ text: "🔁 Files නැත්නම් Retry / නැවත යවන්න", callback_data: "check_ad" }],
         ...(paidPlansEnabled ? [
           [{ text: "⚡ Skip Ad with 5 Stars (Instant)", callback_data: `buy_fast_pass_${payload}` }],
           [{ text: "👑 Get VIP (Weekly / Monthly / Lifetime)", callback_data: "vip_pay_bank" }],
@@ -1247,7 +1344,7 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
       ],
     };
 
-    const previewMsg = `🍿 <b>PixelPop File Ready for Download:</b>\n━━━━━━━━━━━━━━━━━━━━\n${titleDisplay}📁 <b>Total Files:</b> ${fileCount} File(s)\n🆓 <b>Free Access:</b> Click 'Watch Ad', complete the sponsor verification, and tap 'I have watched ad'.\n${paidPlansEnabled ? "⚡ <b>Instant Access:</b> 5 Stars or VIP plans are also available.\n" : ""}━━━━━━━━━━━━━━━━━━━━`;
+    const previewMsg = `🍿 <b>PixelPop File Ready for Download:</b>\n━━━━━━━━━━━━━━━━━━━━\n${titleDisplay}📁 <b>Total Files:</b> ${fileCount} File(s)\n🆓 <b>Free Access:</b> Open the sponsor ad and keep this page open for 5 seconds. The bot will send files automatically. If files do not arrive, return here and tap Retry.\n${paidPlansEnabled ? "⚡ <b>Instant Access:</b> 5 Stars or VIP plans are also available.\n" : ""}━━━━━━━━━━━━━━━━━━━━`;
 
     let sentPhoto = false;
     if (posterUrl && previewMsg.length <= 950) {
@@ -1276,23 +1373,23 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
 
 // ================= FILE DELIVERY & DELETION QUEUE =================
 async function sendBatchFiles(env, chatId, msgIds, isVip = false) {
-  let results = [];
+  const results = [];
   if (!msgIds || msgIds.length === 0) return results;
 
-  let sentMessageIds = [];
-
-  for (const msgId of msgIds) {
-    const res = await callTelegram(env.BOT_TOKEN, "copyMessage", {
+  const sentMessageIds = [];
+  // Send in small parallel groups to reduce latency without flooding Telegram's per-chat limits.
+  for (let offset = 0; offset < msgIds.length; offset += 5) {
+    const group = msgIds.slice(offset, offset + 5);
+    const groupResults = await Promise.all(group.map((msgId) => callTelegram(env.BOT_TOKEN, "copyMessage", {
       chat_id: chatId,
       from_chat_id: env.STORAGE_CHANNEL_ID,
       message_id: msgId,
-      protect_content: true, // 🛡️ Prevent forwarding and saving
-    });
-
-    if (res.ok) {
-      sentMessageIds.push(res.result.message_id);
+      protect_content: false, // Users need to be able to save files to their device.
+    })));
+    for (const res of groupResults) {
+      if (res?.ok) sentMessageIds.push(res.result.message_id);
+      results.push(res);
     }
-    results.push(res);
   }
 
   if (isVip) {
@@ -1305,31 +1402,33 @@ async function sendBatchFiles(env, chatId, msgIds, isVip = false) {
     return results;
   }
 
-  // Free User 6-Hour Deletion Notice
+  // Free User 12-Hour Deletion Notice
   const warningMsg = await callTelegram(env.BOT_TOKEN, "sendMessage", {
     chat_id: chatId,
     parse_mode: "HTML",
-    text: `⚠️ <b>IMPORTANT NOTICE / විශේෂ දැනුම්දීමයි:</b>\n━━━━━━━━━━━━━━━━━━━━\n🇬🇧 <b>English:</b>\nThese files will be <b>automatically deleted in 6 hours</b> due to copyright limits.\n👉 <b>Please forward them to your 'Saved Messages' or save to your device right now!</b>\n\n🇱🇰 <b>සිංහල:</b>\nප්‍රකාශන හිමිකම් සීමා නිසා මෙම Files <b>පැය 6කින් ස්වයංක්‍රීයව මැකී යනු ඇත.</b>\n👉 <b>දැන්ම ඔබගේ 'Saved Messages' වෙත Forward කරගන්න!</b>\n━━━━━━━━━━━━━━━━━━━━`,
+    text: `⚠️ <b>IMPORTANT NOTICE / විශේෂ දැනුම්දීමයි:</b>\n━━━━━━━━━━━━━━━━━━━━\n🇬🇧 <b>English:</b>\nThese files will be <b>automatically deleted in 12 hours</b> due to copyright limits.\n👉 <b>Please save them to your phone or device right now!</b>\n\n🇱🇰 <b>සිංහල:</b>\nප්‍රකාශන හිමිකම් සීමා නිසා මෙම Files <b>පැය 12කින් ස්වයංක්‍රීයව මැකී යනු ඇත.</b>\n👉 <b>දැන්ම ඔබගේ දුරකථනයට හෝ Device එකට Save කරගන්න!</b>\n━━━━━━━━━━━━━━━━━━━━`,
   });
 
   if (warningMsg.ok) {
     sentMessageIds.push(warningMsg.result.message_id);
   }
 
-  // Schedule deletion in 6 hours
-  const deleteAt = Date.now() + 6 * 60 * 60 * 1000;
+  // Schedule deletion in 12 hours
+  const deleteAt = Date.now() + 12 * 60 * 60 * 1000;
   for (const sentId of sentMessageIds) {
     await env.DB.prepare(`
       INSERT INTO deletions (chat_id, message_id, delete_at, reminded) VALUES (?, ?, ?, 0)
     `).bind(chatId, sentId, deleteAt).run();
   }
 
-  // ⏱️ Record download timestamp, increment daily downloads quota, and invalidate verify_token (single use)
+  // Invalidate the one-time token only when every requested file was delivered successfully.
+  const deliverySucceeded = results.length === msgIds.length && results.every((r) => r?.ok);
   await env.DB.prepare(`
-    UPDATE users 
-    SET last_download_at = ?, daily_downloads = daily_downloads + 1, verify_token = NULL 
+    UPDATE users
+    SET last_download_at = ?, daily_downloads = daily_downloads + 1,
+        verify_token = CASE WHEN ? = 1 THEN NULL ELSE verify_token END
     WHERE user_id = ?
-  `).bind(Date.now(), chatId).run();
+  `).bind(Date.now(), deliverySucceeded ? 1 : 0, chatId).run();
 
   return results;
 }
@@ -1380,7 +1479,7 @@ async function handleScheduledTasks(env) {
         await callTelegram(env.BOT_TOKEN, "sendMessage", {
           chat_id: r.chat_id,
           parse_mode: "HTML",
-          text: "⏰ <b>REMINDER / මතක් කිරීමක්:</b>\nඔබ බාගත කළ Files තවත් <b>විනාඩි 30කින් ස්වයංක්‍රීයව මැකී යනු ඇත!</b> කරුණාකර දැන්ම Saved Messages වෙත Forward කරගන්න.",
+          text: "⏰ <b>REMINDER / මතක් කිරීමක්:</b>\nඔබ බාගත කළ Files තවත් <b>විනාඩි 30කින් ස්වයංක්‍රීයව මැකී යනු ඇත!</b> කරුණාකර දැන්ම ඔබගේ දුරකථනයට හෝ Device එකට Save කරගන්න.",
         });
         await env.DB.prepare(`
           UPDATE deletions SET reminded = 1 WHERE chat_id = ?
@@ -1555,7 +1654,7 @@ async function sendVipInfoCard(env, chatId) {
     return;
   }
 
-  const text = `👑 <b>PixelPop VIP Membership Club</b>\n━━━━━━━━━━━━━━━━━━━━\n🌟 <b>VIP විශේෂ වරප්‍රසාද:</b>\n• 🚫 <b>Zero Ads:</b> කිසිදු Sponsor Ad එකක් නැත\n• ⏳ <b>No Cooldown:</b> ලිමිට් නැතිව එක දිගට Downloads\n• 🛡️ <b>Permanent:</b> Files පැය 6කින් මැකී යන්නේ නැත\n• ⚡ <b>Complete Seasons:</b> 1-Click Instant Downloads\n\n💎 <b>පැකේජ මිල ගණන් (Flexible VIP Plans):</b>\n• 🗓️ <b>Weekly Pass (දින 7):</b> LKR 100/= (හෝ ⭐️ 20 Stars)\n• 🗓️ <b>Monthly Pass (දින 30):</b> LKR 300/= (හෝ ⭐️ 60 Stars)\n• 👑 <b>Lifetime VIP (සදාකාලික):</b> LKR 2500/= (හෝ ⭐️ 500 Stars)\n━━━━━━━━━━━━━━━━━━━━\nගෙවීම් සිදු කිරීමට පහත Button එකක් තෝරන්න:`;
+  const text = `👑 <b>PixelPop VIP Membership Club</b>\n━━━━━━━━━━━━━━━━━━━━\n🌟 <b>VIP විශේෂ වරප්‍රසාද:</b>\n• 🚫 <b>Zero Ads:</b> කිසිදු Sponsor Ad එකක් නැත\n• ⏳ <b>No Cooldown:</b> ලිමිට් නැතිව එක දිගට Downloads\n• 🛡️ <b>Permanent:</b> Files auto-delete නොවේ\n• ⚡ <b>Complete Seasons:</b> 1-Click Instant Downloads\n\n💎 <b>පැකේජ මිල ගණන් (Flexible VIP Plans):</b>\n• 🗓️ <b>Weekly Pass (දින 7):</b> LKR 100/= (හෝ ⭐️ 20 Stars)\n• 🗓️ <b>Monthly Pass (දින 30):</b> LKR 300/= (හෝ ⭐️ 60 Stars)\n• 👑 <b>Lifetime VIP (සදාකාලික):</b> LKR 2500/= (හෝ ⭐️ 500 Stars)\n━━━━━━━━━━━━━━━━━━━━\nගෙවීම් සිදු කිරීමට පහත Button එකක් තෝරන්න:`;
 
   await callTelegram(env.BOT_TOKEN, "sendMessage", {
     chat_id: chatId,
@@ -1784,15 +1883,13 @@ async function grantReferralIfPending(env, userId) {
 
 // ================= ADMIN HELPERS & BROADCAST =================
 async function generateBatchLink(env, chatId) {
-  let batchRes;
+  let batchRes = { results: [] };
   try {
     batchRes = await env.DB.prepare(`
       SELECT message_id FROM admin_batch WHERE admin_id = ? ORDER BY id ASC
     `).bind(chatId).all();
-  } catch {
-    batchRes = await env.DB.prepare(`
-      SELECT message_id FROM admin_batch ORDER BY id ASC
-    `).all();
+  } catch (err) {
+    console.error("Admin queue query error:", err);
   }
 
   const batch = (batchRes?.results || []).map((r) => r.message_id);
@@ -1814,9 +1911,10 @@ async function generateBatchLink(env, chatId) {
   } catch {}
 
   const botUsername = env.BOT_USERNAME || "PixelPopStorebot";
+  const paidPlansEnabled = await arePaidPlansEnabled(env);
 
   // 🎬 TMDb Auto Poster & Metadata Lookup
-  const tmdb = await fetchTmdbInfo(env, title);
+  const tmdb = await fetchTmdbInfo(env, title, { adminProvidedTitle: true });
   const posterUrl = tmdb?.poster || null;
   const displayTitle = tmdb?.title || title;
   const yearText = tmdb?.year ? ` (${tmdb.year})` : "";
@@ -1841,7 +1939,7 @@ async function generateBatchLink(env, chatId) {
     }
 
     const link = `https://t.me/${botUsername}?start=${token}`;
-    channelPostText = `🎬 <b>${escapeHtml(displayTitle)}</b>${yearText}\n${ratingText}━━━━━━━━━━━━━━━━━━━━\n${overviewText}⚡ <b>VIP Access:</b> Instant 0 Ads (Permanent)\n🆓 <b>Free Access:</b> Watch 5s Sponsor Ad\n━━━━━━━━━━━━━━━━━━━━\n👇 <b>Download Link:</b>\n🔗 <a href="${link}">${escapeHtml(displayTitle)}</a>`;
+    channelPostText = `🎬 <b>${escapeHtml(displayTitle)}</b>${yearText}\n${ratingText}━━━━━━━━━━━━━━━━━━━━\n${overviewText}${paidPlansEnabled ? "⚡ <b>VIP Access:</b> Instant 0 Ads (Permanent)\\n" : ""}🆓 <b>Free Access:</b> Watch 5s Sponsor Ad\n━━━━━━━━━━━━━━━━━━━━\n👇 <b>Download Link:</b>\n🔗 <a href="${link}">${escapeHtml(displayTitle)}</a>`;
 
     const adminKb = {
       inline_keyboard: [[{ text: "📥 Download / ලබාගන්න", url: link }]],
@@ -1873,22 +1971,24 @@ async function generateBatchLink(env, chatId) {
     const seriesRoot = titleMeta.isSeries && titleMeta.seriesName ? titleMeta.seriesName : displayTitle;
     const detectedSeason = titleMeta.season || 1;
 
-    // 1. VIP Full Season Pack Link (All episodes in 1-Click)
-    const packToken = `b_${crypto.randomUUID().slice(0, 8)}`;
-    const packTitle = `${seriesRoot} Season ${detectedSeason} (Complete Season Pack)`;
-    try {
-      await env.DB.prepare(`
-        INSERT INTO batches (token, title, poster_url, msg_ids, created_by, created_at, series_name, season, episode)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-      `).bind(packToken, packTitle, posterUrl, JSON.stringify(uniqueIds), chatId, Date.now(), seriesRoot, detectedSeason).run();
-    } catch {
-      await env.DB.prepare(`
-        INSERT INTO batches (token, title, poster_url, msg_ids, created_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).bind(packToken, packTitle, posterUrl, JSON.stringify(uniqueIds), chatId, Date.now()).run();
+    // 1. VIP Full Season Pack Link (only create while paid plans are enabled).
+    let packLink = null;
+    if (paidPlansEnabled) {
+      const packToken = `b_${crypto.randomUUID().slice(0, 8)}`;
+      const packTitle = `${seriesRoot} Season ${detectedSeason} (Complete Season Pack)`;
+      try {
+        await env.DB.prepare(`
+          INSERT INTO batches (token, title, poster_url, msg_ids, created_by, created_at, series_name, season, episode)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+        `).bind(packToken, packTitle, posterUrl, JSON.stringify(uniqueIds), chatId, Date.now(), seriesRoot, detectedSeason).run();
+      } catch {
+        await env.DB.prepare(`
+          INSERT INTO batches (token, title, poster_url, msg_ids, created_by, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).bind(packToken, packTitle, posterUrl, JSON.stringify(uniqueIds), chatId, Date.now()).run();
+      }
+      packLink = `https://t.me/${botUsername}?start=${packToken}`;
     }
-
-    const packLink = `https://t.me/${botUsername}?start=${packToken}`;
 
     // 2. Individual Episode Links for Free Users
     let epLinks = [];
@@ -1917,22 +2017,23 @@ async function generateBatchLink(env, chatId) {
       .map((e) => `🔹 <b>Episode ${e.epNum < 10 ? "0" + e.epNum : e.epNum}:</b> <a href="${e.link}">Download Episode</a>`)
       .join("\n");
 
-    channelPostText = `🎬 <b>${escapeHtml(displayTitle)}</b>${yearText}\n${ratingText}━━━━━━━━━━━━━━━━━━━━\n${overviewText}👑 <b>VIP Members (Complete Season in 1-Click):</b>\n👉 <a href="${packLink}">⚡ Download Complete Season (${uniqueIds.length} Episodes)</a>\n\n🆓 <b>Free Users (Episode by Episode):</b>\n${epListText}\n━━━━━━━━━━━━━━━━━━━━\n<i>🛡️ Protected content: Forwarding is disabled.</i>`;
+    channelPostText = `🎬 <b>${escapeHtml(displayTitle)}</b>${yearText}\n${ratingText}━━━━━━━━━━━━━━━━━━━━\n${overviewText}${paidPlansEnabled ? `👑 <b>VIP Members (Complete Season in 1-Click):</b>\n👉 <a href="${packLink}">⚡ Download Complete Season (${uniqueIds.length} Episodes)</a>\n\n` : ""}🆓 <b>Free Users (Episode by Episode):</b>\n${epListText}\n━━━━━━━━━━━━━━━━━━━━\n<i>🛡️ Files can be saved to your device.</i>`;
 
-    const adminKb = {
-      inline_keyboard: [
-        [{ text: "👑 Complete Season (VIP Pack)", url: packLink }],
-      ],
-    };
+    const adminKb = paidPlansEnabled
+      ? { inline_keyboard: [[{ text: "👑 Complete Season (VIP Pack)", url: packLink }]] }
+      : undefined;
 
     let sentPhoto = false;
+    const vipPackAdminText = paidPlansEnabled
+      ? `━━━━━━━━━━━━━━━━━━━━\n👑 <b>VIP Season Pack Link:</b>\n<code>${packLink}</code>\n\n`
+      : "";
     if (posterUrl && channelPostText.length <= 950) {
       const pRes = await callTelegram(env.BOT_TOKEN, "sendPhoto", {
         chat_id: chatId,
         photo: posterUrl,
-        caption: `🎉 <b>Series Links Generated!</b>\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>VIP Season Pack Link:</b>\n<code>${packLink}</code>\n\n📢 <b>Ready-to-Post Channel Message:</b>\n\n${channelPostText}`,
+        caption: `🎉 <b>Series Links Generated!</b>\n${vipPackAdminText}📢 <b>Ready-to-Post Channel Message:</b>\n\n${channelPostText}`,
         parse_mode: "HTML",
-        reply_markup: adminKb,
+        ...(adminKb ? { reply_markup: adminKb } : {}),
       });
       sentPhoto = pRes.ok;
     }
@@ -1941,19 +2042,44 @@ async function generateBatchLink(env, chatId) {
       await callTelegram(env.BOT_TOKEN, "sendMessage", {
         chat_id: chatId,
         parse_mode: "HTML",
-        text: `🎉 <b>Series Links Generated!</b>\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>VIP Season Pack Link:</b>\n<code>${packLink}</code>\n\n📢 <b>Ready-to-Post Channel Message:</b>\n\n${channelPostText}`,
-        reply_markup: adminKb,
+        text: `🎉 <b>Series Links Generated!</b>\n${vipPackAdminText}📢 <b>Ready-to-Post Channel Message:</b>\n\n${channelPostText}`,
+        ...(adminKb ? { reply_markup: adminKb } : {}),
       });
     }
   }
 
-  // Clear admin draft title & batch queue
+  // Clear only this admin's temporary draft and queue; never fall back to a table-wide delete.
   try {
     await env.DB.prepare(`DELETE FROM users WHERE user_id = 'admin_title_draft'`).run();
-    await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
-  } catch {
-    await env.DB.prepare(`DELETE FROM admin_batch`).run();
+  } catch (err) {
+    console.error("Admin draft cleanup error:", err);
   }
+  try {
+    await env.DB.prepare(`DELETE FROM admin_batch WHERE admin_id = ?`).bind(chatId).run();
+  } catch (err) {
+    console.error("Admin queue cleanup error:", err);
+  }
+}
+
+async function setAdminCommandMenu(env, chatId) {
+  const commands = [
+    { command: "admin", description: "Open admin control panel" },
+    { command: "add", description: "Start a new upload batch" },
+    { command: "title", description: "Set the current batch title" },
+    { command: "done", description: "Generate download links" },
+    { command: "cancel", description: "Clear my upload queue" },
+    { command: "stats", description: "View bot statistics" },
+    { command: "ban", description: "Ban a user by ID" },
+    { command: "unban", description: "Unban a user by ID" },
+    { command: "broadcast", description: "Broadcast to all users" },
+    { command: "broadcast_vip", description: "Broadcast to VIP users" },
+    { command: "broadcast_free", description: "Broadcast to free users" },
+    { command: "msg", description: "Send a message to a user ID" },
+  ];
+  return callTelegram(env.BOT_TOKEN, "setMyCommands", {
+    scope: { type: "chat", chat_id: Number(chatId) },
+    commands,
+  });
 }
 
 // ================= MASTER INTERACTIVE ADMIN DASHBOARD =================
@@ -1979,6 +2105,7 @@ async function sendAdminDashboard(env, chatId, editCb = null) {
   }
 
   const botUsername = env.BOT_USERNAME || "PixelPopStorebot";
+  const tmdbTitleSearchEnabled = await isTmdbTitleSearchEnabled(env);
   const text = `🎛️ <b>PixelPop Master Admin Control Panel</b>\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>Owner:</b> <code>${chatId}</code>\n🤖 <b>Bot:</b> @${botUsername}\n\n📊 <b>Quick Overview:</b>\n• 👥 <b>Total Users:</b> <b>${totalUsers?.c || 0}</b>\n• 👑 <b>Active VIPs:</b> <b>${activeVip?.c || 0}</b>\n• 📥 <b>Today's Downloads:</b> <b>${todayDownloads?.total || 0}</b>\n• 📩 <b>Pending Requests:</b> <b>${pendingRequests?.c || 0}</b>\n• 💳 <b>Pending Slips:</b> <b>${pendingSlips?.c || 0}</b>\n• 📦 <b>Files in Queue:</b> <b>${queueCount}</b>\n━━━━━━━━━━━━━━━━━━━━\n<i>පහත Buttons මගින් Bot සම්පූර්ණයෙන්ම Manage කරන්න:</i>`;
 
   const kb = {
@@ -2001,6 +2128,9 @@ async function sendAdminDashboard(env, chatId, editCb = null) {
       ],
       [
         { text: (await arePaidPlansEnabled(env)) ? "🟢 Paid Plans ON — turn OFF" : "🔴 Paid Plans OFF — turn ON", callback_data: "adm_toggle_paid" },
+      ],
+      [
+        { text: tmdbTitleSearchEnabled ? "🟢 TMDb name search ON — turn OFF" : "🔴 TMDb name search OFF — turn ON", callback_data: "adm_toggle_tmdb" },
       ],
       [
         { text: "❌ Close Panel", callback_data: "adm_close" },
@@ -2045,12 +2175,30 @@ async function handleAdminPanelCallback(cb, env) {
       INSERT INTO bot_settings (setting_key, setting_value) VALUES ('paid_plans_enabled', ?)
       ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value
     `).bind(nextEnabled ? "1" : "0").run();
-    if (!nextEnabled) {
-      // Clear all active VIP entitlements. Payment ledger remains private for accounting.
-      await env.DB.prepare("UPDATE users SET is_vip = 0, vip_until = 0 WHERE is_vip != 0 OR vip_until != 0").run();
-    }
+    // Preserve subscription records while disabled. The global switch hides/disables VIP features;
+    // turning plans back on restores any subscription whose stored expiry has not passed.
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
-      callback_query_id: cb.id, text: nextEnabled ? "Paid plans ON" : "Paid plans OFF; all VIP disabled", show_alert: true,
+      callback_query_id: cb.id,
+      text: nextEnabled ? "Paid plans ON; valid VIP memberships restored" : "Paid plans OFF; VIP options hidden (subscriptions preserved)",
+      show_alert: true,
+    });
+    await sendAdminDashboard(env, chatId, cb);
+    return;
+  }
+
+  if (data === "adm_toggle_tmdb") {
+    const nextEnabled = !(await isTmdbTitleSearchEnabled(env));
+    await env.DB.prepare(`
+      INSERT INTO bot_settings (setting_key, setting_value) VALUES ('tmdb_title_search_enabled', ?)
+      ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value
+    `).bind(nextEnabled ? "1" : "0").run();
+    tmdbTitleSearchCacheValue = nextEnabled;
+    tmdbTitleSearchCacheUntil = Date.now() + TMDB_SETTINGS_CACHE_MS;
+    tmdbResultCache.clear();
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
+      callback_query_id: cb.id,
+      text: nextEnabled ? "TMDb name search ON" : "TMDb name search OFF; TMDb links still work",
+      show_alert: true,
     });
     await sendAdminDashboard(env, chatId, cb);
     return;
@@ -2221,11 +2369,11 @@ async function handleAdminPanelCallback(cb, env) {
   }
 
   if (data === "adm_queue") {
-    let batchRes;
+    let batchRes = { results: [] };
     try {
       batchRes = await env.DB.prepare(`SELECT message_id FROM admin_batch WHERE admin_id = ? ORDER BY id ASC`).bind(chatId).all();
-    } catch {
-      batchRes = await env.DB.prepare(`SELECT message_id FROM admin_batch ORDER BY id ASC`).all();
+    } catch (err) {
+      console.error("Admin queue query error:", err);
     }
     const batch = (batchRes?.results || []).map((r) => r.message_id);
 
@@ -2267,7 +2415,8 @@ async function handleAdminPanelCallback(cb, env) {
 
   if (data === "adm_config") {
     const coAdmins = env.CO_ADMINS ? env.CO_ADMINS : "None (Strictly Single Owner 🔒)";
-    const text = `⚙️ <b>PixelPop System Configuration:</b>\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>Primary Owner ID:</b> <code>${env.ADMIN_ID || "Not set"}</code>\n🛡️ <b>Co-Admins:</b> <code>${coAdmins}</code>\n🤖 <b>Backup Bot:</b> @${env.BACKUP_BOT_USERNAME || "Not set"}\n📢 <b>Force-Sub Channel:</b> ${env.FORCE_SUB_CHANNEL_LINK || "Not set"}\n📁 <b>Storage Channel ID:</b> <code>${env.STORAGE_CHANNEL_ID || "Not set"}</code>\n⚡ <b>Free Daily Limit:</b> Unlimited (0)\n━━━━━━━━━━━━━━━━━━━━\n<i>ඔබේ Owner ID එකට පමණක් Admin Panel එක විවෘත වේ.</i>`;
+    const tmdbEnabled = await isTmdbTitleSearchEnabled(env);
+    const text = `⚙️ <b>PixelPop System Configuration:</b>\n━━━━━━━━━━━━━━━━━━━━\n👑 <b>Primary Owner ID:</b> <code>${env.ADMIN_ID || "Not set"}</code>\n🛡️ <b>Co-Admins:</b> <code>${coAdmins}</code>\n🤖 <b>Backup Bot:</b> @${env.BACKUP_BOT_USERNAME || "Not set"}\n📢 <b>Force-Sub Channel:</b> ${env.FORCE_SUB_CHANNEL_LINK || "Not set"}\n📁 <b>Storage Channel ID:</b> <code>${env.STORAGE_CHANNEL_ID || "Not set"}</code>\n🔎 <b>TMDb title-name search:</b> ${tmdbEnabled ? "ON" : "OFF (TMDb links only)"}\n⚡ <b>Free Daily Limit:</b> Unlimited (0)\n━━━━━━━━━━━━━━━━━━━━\n<i>ඔබේ Owner ID එකට පමණක් Admin Panel එක විවෘත වේ.</i>`;
 
     const kb = {
       inline_keyboard: [
@@ -2468,43 +2617,91 @@ async function handleInlineQuery(iq, env) {
 }
 
 // ================= TMDB AUTO POSTER & LIVE SEARCH & MOVIE REQUESTS =================
-async function fetchTmdbInfo(env, query) {
-  if (!env.TMDB_API_KEY) return null;
+async function isTmdbTitleSearchEnabled(env) {
+  const now = Date.now();
+  if (tmdbTitleSearchCacheValue !== null && now < tmdbTitleSearchCacheUntil) return tmdbTitleSearchCacheValue;
+  if (!env.DB) return tmdbTitleSearchCacheValue ?? true;
   try {
-    const cleanQuery = query
-      .replace(/[\[\(].*?[\]\)]/g, "")
-      .replace(/\b(1080p|720p|480p|4k|hdr|bluray|web-dl|hdrip|x264|x265|hevc|season\s*\d+|s\d+e\d+|episode\s*\d+)\b/gi, "")
-      .trim();
+    const row = await env.DB.prepare("SELECT setting_value FROM bot_settings WHERE setting_key = 'tmdb_title_search_enabled'").first();
+    tmdbTitleSearchCacheValue = row ? row.setting_value === "1" : true;
+    tmdbTitleSearchCacheUntil = now + TMDB_SETTINGS_CACHE_MS;
+    return tmdbTitleSearchCacheValue;
+  } catch (err) {
+    console.error("TMDb setting read error:", err);
+    return tmdbTitleSearchCacheValue ?? true;
+  }
+}
 
-    if (!cleanQuery) return null;
+function parseTmdbLink(value) {
+  const match = String(value || "").match(/(?:https?:\/\/)?(?:www\.)?themoviedb\.org\/(movie|tv)\/(\d+)(?:-([^/?#\s]+))?/i);
+  if (!match) return null;
+  return { mediaType: match[1].toLowerCase(), id: match[2], slug: match[3] || "" };
+}
 
-    const url = `https://api.themoviedb.org/3/search/multi?api_key=${encodeURIComponent(env.TMDB_API_KEY)}&query=${encodeURIComponent(cleanQuery)}&include_adult=false&language=en-US&page=1`;
+function tmdbLinkSearchTitle(value) {
+  const parsed = parseTmdbLink(value);
+  return parsed?.slug ? decodeURIComponent(parsed.slug).replace(/[-_]+/g, " ").trim() : "";
+}
+
+async function fetchTmdbInfo(env, query, options = {}) {
+  if (!env.TMDB_API_KEY) return null;
+  const tmdbLink = parseTmdbLink(query);
+  // When direct name lookup is disabled, still allow TMDb metadata for titles
+  // explicitly supplied by the admin while creating a batch.
+  if (!tmdbLink && !options.adminProvidedTitle && !(await isTmdbTitleSearchEnabled(env))) return null;
+
+  const cleanQuery = tmdbLink ? "" : String(query || "")
+    .replace(/[\[\(].*?[\]\)]/g, "")
+    .replace(/\b(1080p|720p|480p|4k|hdr|bluray|web-dl|hdrip|x264|x265|hevc|season\s*\d+|s\d+e\d+|episode\s*\d+)\b/gi, "")
+    .trim();
+  if (!tmdbLink && !cleanQuery) return null;
+
+  const cacheKey = tmdbLink ? `id:${tmdbLink.mediaType}:${tmdbLink.id}` : `q:${cleanQuery.toLowerCase()}`;
+  const cached = tmdbResultCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached) tmdbResultCache.delete(cacheKey);
+
+  try {
+    const url = tmdbLink
+      ? `https://api.themoviedb.org/3/${tmdbLink.mediaType}/${tmdbLink.id}?api_key=${encodeURIComponent(env.TMDB_API_KEY)}&language=en-US`
+      : `https://api.themoviedb.org/3/search/multi?api_key=${encodeURIComponent(env.TMDB_API_KEY)}&query=${encodeURIComponent(cleanQuery)}&include_adult=false&language=en-US&page=1`;
     const res = await fetch(url);
-    if (!res.ok) return null;
+    if (!res.ok) {
+      tmdbResultCache.set(cacheKey, { value: null, expiresAt: Date.now() + 30_000 });
+      return null;
+    }
     const data = await res.json();
-    const item = (data.results || []).find((r) => r.media_type === "movie" || r.media_type === "tv") || data.results?.[0];
-    if (!item) return null;
-
-    const title = item.title || item.name || cleanQuery;
-    const year = (item.release_date || item.first_air_date || "").slice(0, 4);
-    const poster = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null;
-    const rating = item.vote_average ? item.vote_average.toFixed(1) : null;
-    let overview = item.overview || "";
-    if (overview.length > 250) {
-      overview = overview.slice(0, 247) + "...";
+    const item = tmdbLink ? data : (data.results || []).find((r) => r.media_type === "movie" || r.media_type === "tv");
+    if (!item || (!tmdbLink && !item.id)) {
+      tmdbResultCache.set(cacheKey, { value: null, expiresAt: Date.now() + 30_000 });
+      return null;
     }
 
-    return {
+    const title = item.title || item.name || cleanQuery || `TMDb ${tmdbLink?.id || ""}`;
+    const year = (item.release_date || item.first_air_date || "").slice(0, 4);
+    const poster = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null;
+    const rating = item.vote_average ? Number(item.vote_average).toFixed(1) : null;
+    let overview = item.overview || "";
+    if (overview.length > 250) overview = overview.slice(0, 247) + "...";
+
+    const normalized = {
       id: item.id,
-      media_type: item.media_type || "movie",
+      media_type: tmdbLink ? tmdbLink.mediaType : (item.media_type || "movie"),
       title,
       year,
       poster,
       rating,
       overview,
     };
+    tmdbResultCache.set(cacheKey, { value: normalized, expiresAt: Date.now() + TMDB_RESULT_CACHE_MS });
+    if (tmdbResultCache.size > 500) {
+      const oldestKey = tmdbResultCache.keys().next().value;
+      if (oldestKey) tmdbResultCache.delete(oldestKey);
+    }
+    return normalized;
   } catch (err) {
     console.error("TMDb fetch error:", err);
+    tmdbResultCache.set(cacheKey, { value: null, expiresAt: Date.now() + 30_000 });
     return null;
   }
 }
@@ -3056,10 +3253,12 @@ async function handleConfirmEpisodeDownload(env, cb, chosenToken, parentToken, s
 
 // 🔍 Master In-Bot & In-Group Live Search
 async function handleLiveSearch(env, chatId, query, replyToMsgId = null, isGroup = false, isExplicitSearch = false, activeTab = null, editCb = null) {
-  query = (query || "").trim();
+  const originalQuery = (query || "").trim();
+  query = tmdbLinkSearchTitle(originalQuery) || originalQuery;
   if (!query || query.length < 2) return;
 
   const botUsername = env.BOT_USERNAME || "PixelPopStorebot";
+  const tmdbPromise = fetchTmdbInfo(env, originalQuery);
 
   // 1. Search Local Batches in D1
   let batches = [];
@@ -3087,8 +3286,8 @@ async function handleLiveSearch(env, chatId, query, replyToMsgId = null, isGroup
     }
   }
 
-  // 2. Query TMDb for Auto Poster & Synopsis
-  const tmdb = await fetchTmdbInfo(env, query);
+  // TMDb lookup runs concurrently with local D1 search and is cached in-memory.
+  const tmdb = await tmdbPromise;
 
   // Case A: Batches found in PixelPop database
   if (batches.length > 0) {
