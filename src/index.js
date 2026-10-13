@@ -1391,19 +1391,18 @@ async function sendBatchFiles(env, chatId, msgIds, isVip = false) {
   if (!msgIds || msgIds.length === 0) return results;
 
   const sentMessageIds = [];
-  // Send in small parallel groups to reduce latency without flooding Telegram's per-chat limits.
-  for (let offset = 0; offset < msgIds.length; offset += 5) {
-    const group = msgIds.slice(offset, offset + 5);
-    const groupResults = await Promise.all(group.map((msgId) => callTelegram(env.BOT_TOKEN, "copyMessage", {
+  // Preserve the exact stored episode order. Parallel copyMessage calls can complete
+  // in a different order, causing episodes to appear shuffled in the user's chat.
+  // Await each Telegram copy before requesting the next one.
+  for (const msgId of msgIds) {
+    const res = await callTelegram(env.BOT_TOKEN, "copyMessage", {
       chat_id: chatId,
       from_chat_id: env.STORAGE_CHANNEL_ID,
       message_id: msgId,
       protect_content: false, // Users need to be able to save files to their device.
-    })));
-    for (const res of groupResults) {
-      if (res?.ok) sentMessageIds.push(res.result.message_id);
-      results.push(res);
-    }
+    });
+    if (res?.ok) sentMessageIds.push(res.result.message_id);
+    results.push(res);
   }
 
   if (isVip) {
