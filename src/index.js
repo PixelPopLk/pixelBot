@@ -238,7 +238,7 @@ export default {
         const results = await sendBatchFiles(env, userId.toString(), idsToSend, false);
         const allSent = results.length === idsToSend.length && results.every((r) => r?.ok);
         if (allSent) {
-          await env.DB.prepare("UPDATE users SET delivered = 1, verify_token = NULL WHERE user_id = ? AND ad_started_at = ?")
+          await env.DB.prepare("UPDATE users SET delivered = 1 WHERE user_id = ? AND ad_started_at = ?")
             .bind(userId.toString(), adStartedAt).run();
           return new Response(JSON.stringify({ ok: true, status: "delivered", files_sent: results.length }), { headers: jsonHeaders });
         }
