@@ -1174,7 +1174,7 @@ async function handleAdVerification(env, chatId, cb) {
     return;
   }
 
-  if (user.delivered === 1) {
+  if (Number(user.delivered) === 1) {
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", {
       callback_query_id: cb.id,
       text: "✅ Files already sent! Check your chat.\nFiles දැනටමත් ඔබ වෙත එවා ඇත!",
@@ -1240,18 +1240,32 @@ async function handleAdVerification(env, chatId, cb) {
 
   // Check if user is VIP (VIP files are never auto-deleted)
   const isVip = await arePaidPlansEnabled(env) && isUserVipActive(user);
-  if (!idsToSend.length) {
+  if (!Array.isArray(idsToSend) || idsToSend.length === 0) {
+    // Never leave the session locked if its file list is empty or malformed.
+    await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ? AND ad_started_at = ?")
+      .bind(chatId, adStartedAt).run();
     await sendReply(env, chatId, "❌ මෙම download session එකේ files හමු වුණේ නැහැ. කරුණාකර අලුත් download link එකක් විවෘත කරන්න.");
     return;
   }
 
-  const results = await sendBatchFiles(env, chatId, idsToSend, isVip);
-  if (results.length === idsToSend.length && results.every((r) => r?.ok)) {
-    await env.DB.prepare("UPDATE users SET delivered = 1 WHERE user_id = ?").bind(chatId).run();
-  } else {
-    await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ?").bind(chatId).run();
-    console.error("Ad-verified file delivery incomplete", { userId: chatId, expected: idsToSend.length, sent: results.filter((r) => r?.ok).length });
-    await sendReply(env, chatId, "⚠️ සමහර files යැවීමට නොහැකි වුණා. Retry බොත්තම ඔබන්න. ගැටලුව දිගටම තිබුණොත් admin ට දන්වන්න.");
+  try {
+    const results = await sendBatchFiles(env, chatId, idsToSend, isVip);
+    if (results.length === idsToSend.length && results.every((r) => r?.ok)) {
+      await env.DB.prepare("UPDATE users SET delivered = 1, verify_token = NULL WHERE user_id = ? AND ad_started_at = ?")
+        .bind(chatId, adStartedAt).run();
+    } else {
+      await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ? AND ad_started_at = ?")
+        .bind(chatId, adStartedAt).run();
+      console.error("Ad-verified file delivery incomplete", { userId: chatId, expected: idsToSend.length, sent: results.filter((r) => r?.ok).length });
+      await sendReply(env, chatId, "⚠️ සමහර files යැවීමට නොහැකි වුණා. Retry බොත්තම ඔබන්න. ගැටලුව දිගටම තිබුණොත් admin ට දන්වන්න.");
+    }
+  } catch (err) {
+    // Release the claim after an exception so Retry can work instead of showing
+    // "already being sent" forever.
+    await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ? AND ad_started_at = ? AND delivered = 0")
+      .bind(chatId, adStartedAt).run();
+    console.error("Manual retry delivery error:", err);
+    await sendReply(env, chatId, "⚠️ Files යැවීමේදී ගැටලුවක් වුණා. Retry නැවත ඔබන්න.");
   }
 }
 
