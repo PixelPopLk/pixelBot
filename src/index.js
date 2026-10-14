@@ -1291,7 +1291,16 @@ async function handleAdVerification(env, chatId, cb) {
     } else {
       await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ? AND ad_started_at = ?")
         .bind(chatId, adStartedAt).run();
-      console.error("Ad-verified file delivery incomplete", { userId: chatId, expected: idsToSend.length, sent: results.filter((r) => r?.ok).length });
+      console.error("Ad-verified file delivery incomplete", {
+        userId: chatId,
+        expected: idsToSend.length,
+        sent: results.filter((r) => r?.ok).length,
+        failed: results.filter((r) => !r?.ok).map((r, index) => ({
+          index,
+          error_code: r?.error_code || null,
+          description: r?.description || "Unknown Telegram copyMessage failure",
+        })),
+      });
       await sendReply(env, chatId, "⚠️ සමහර files යැවීමට නොහැකි වුණා. Retry බොත්තම ඔබන්න. ගැටලුව දිගටම තිබුණොත් admin ට දන්වන්න.");
     }
   } catch (err) {
@@ -3289,7 +3298,7 @@ async function handleBrowseSeasonEpisodes(env, cb, token, seasonNum) {
     const res = await env.DB.prepare(`
       SELECT * FROM batches 
       WHERE series_name = ? OR title LIKE ?
-      ORDER BY episode ASC, created_at ASC
+      ORDER BY created_at DESC, episode ASC
     `).bind(seriesName, `%${seriesName}%`).all();
     all = res?.results || [];
   } catch {
@@ -3370,15 +3379,16 @@ async function handleBrowseEpisodeQuality(env, cb, epToken, parentToken, seasonN
   try {
     const res = await env.DB.prepare(`
       SELECT * FROM batches 
-      WHERE (series_name = ? OR title LIKE ?) AND (season = ? OR title LIKE ?)
+      WHERE series_name = ? OR title LIKE ?
       ORDER BY created_at DESC
-      LIMIT 20
-    `).bind(seriesName, `%${seriesName}%`, seasonNum, `%Season ${seasonNum}%`).all();
+      LIMIT 100
+    `).bind(seriesName, `%${seriesName}%`).all();
 
     variants = (res?.results || []).filter((b) => {
       const bMeta = parseMediaTitle(b.title);
+      const bSeason = b.season || bMeta.season || 1;
       const bEp = b.episode || bMeta.episode;
-      return bEp === epNum;
+      return Number(bSeason) === Number(seasonNum) && Number(bEp) === Number(epNum);
     });
   } catch {
     variants = [epBatch];
