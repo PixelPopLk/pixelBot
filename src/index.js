@@ -1536,7 +1536,7 @@ async function sendBatchFiles(env, chatId, msgIds, isVip = false, vipExpiresAt =
         chat_id: chatId,
         from_chat_id: env.STORAGE_CHANNEL_ID,
         message_id: msgId,
-        protect_content: false,
+        protect_content: true,
       });
       if (res?.ok) break;
       const retryAfter = Number(res?.parameters?.retry_after || 0);
