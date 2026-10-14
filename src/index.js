@@ -3241,7 +3241,22 @@ async function editTelegramMessage(env, cb, textOrCaption, replyMarkup) {
   if (!msg) return;
   const chatId = msg.chat.id.toString();
   const messageId = msg.message_id;
-  const shownText = textOrCaption;
+  let shownText = textOrCaption;
+  let keyboardObj = Array.isArray(replyMarkup) ? { inline_keyboard: replyMarkup } : replyMarkup;
+
+  // When paid plans are OFF, hide VIP/paid options on edited season and episode
+  // screens too, while leaving the normal free ad-download buttons untouched.
+  if (!isAuthorizedAdmin(chatId, env) && !(await arePaidPlansEnabled(env))) {
+    shownText = hidePaidStatusText(shownText);
+    if (keyboardObj?.inline_keyboard) {
+      keyboardObj = {
+        ...keyboardObj,
+        inline_keyboard: keyboardObj.inline_keyboard
+          .map(row => row.filter(btn => !/vip|paid|stars|bank/i.test(`${btn.text || ""} ${btn.callback_data || ""} ${btn.url || ""}`)))
+          .filter(row => row.length),
+      };
+    }
+  }
 
   if (msg.photo && msg.photo.length > 0) {
     const res = await callTelegram(env.BOT_TOKEN, "editMessageCaption", {
@@ -3249,7 +3264,7 @@ async function editTelegramMessage(env, cb, textOrCaption, replyMarkup) {
       message_id: messageId,
       caption: shownText,
       parse_mode: "HTML",
-      reply_markup: replyMarkup,
+      reply_markup: keyboardObj,
     });
     if (res?.ok) return;
   }
@@ -3259,7 +3274,7 @@ async function editTelegramMessage(env, cb, textOrCaption, replyMarkup) {
     message_id: messageId,
     text: shownText,
     parse_mode: "HTML",
-    reply_markup: replyMarkup,
+    reply_markup: keyboardObj,
   });
 }
 
