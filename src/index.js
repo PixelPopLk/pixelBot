@@ -419,6 +419,59 @@ async function handleMessage(msg, env) {
       return;
     }
 
+    // Admin VIP controls: /vip_on <user_id> [days|lifetime], /vip_off <user_id>
+    if (text === "/vip_on" || text.startsWith("/vip_on ")) {
+      const parts = text.trim().split(/\s+/);
+      const targetUserId = parts[1] || "";
+      const duration = (parts[2] || "30").toLowerCase();
+      if (!/^\d{5,20}$/.test(targetUserId)) {
+        await sendReply(env, chatId, "Usage: <code>/vip_on USER_ID [days|lifetime]</code>\nDefault: 30 days. Example: <code>/vip_on 123456789 30</code>");
+        return;
+      }
+      const targetUser = await env.DB.prepare("SELECT user_id, first_name, username FROM users WHERE user_id = ?").bind(targetUserId).first();
+      if (!targetUser) {
+        await sendReply(env, chatId, "❌ User not found. Ask the user to open the bot and send /start first.");
+        return;
+      }
+      let durationMs;
+      let planLabel;
+      if (duration === "lifetime") {
+        durationMs = 100 * 365 * 24 * 60 * 60 * 1000;
+        planLabel = "Lifetime-style (100-year expiry)";
+      } else {
+        const days = Number(duration);
+        if (!/^\d{1,4}$/.test(duration) || !Number.isInteger(days) || days < 1 || days > 3650) {
+          await sendReply(env, chatId, "❌ VIP duration must be 1–3650 days or <code>lifetime</code>.");
+          return;
+        }
+        durationMs = days * 24 * 60 * 60 * 1000;
+        planLabel = String(days) + " day(s)";
+      }
+      const expiresAt = Date.now() + durationMs;
+      await env.DB.prepare("UPDATE users SET is_vip = 1, vip_until = ? WHERE user_id = ?").bind(expiresAt, targetUserId).run();
+      await sendReply(env, chatId, "✅ VIP activated for <b>" + escapeHtml(targetUser.first_name || targetUser.username || targetUserId) + "</b> (<code>" + targetUserId + "</code>).\nDuration: <b>" + planLabel + "</b>.\nNote: VIP download benefits require Paid Plans to be ON.");
+      await sendReply(env, targetUserId, "👑 <b>Your PixelPop VIP status was activated by an admin.</b>\nDuration: <b>" + planLabel + "</b>. Enjoy VIP benefits while your membership is active.");
+      return;
+    }
+
+    if (text === "/vip_off" || text.startsWith("/vip_off ")) {
+      const parts = text.trim().split(/\s+/);
+      const targetUserId = parts[1] || "";
+      if (!/^\d{5,20}$/.test(targetUserId)) {
+        await sendReply(env, chatId, "Usage: <code>/vip_off USER_ID</code>");
+        return;
+      }
+      const targetUser = await env.DB.prepare("SELECT user_id, first_name, username FROM users WHERE user_id = ?").bind(targetUserId).first();
+      if (!targetUser) {
+        await sendReply(env, chatId, "❌ User not found in the bot database.");
+        return;
+      }
+      await env.DB.prepare("UPDATE users SET is_vip = 0, vip_until = 0 WHERE user_id = ?").bind(targetUserId).run();
+      await sendReply(env, chatId, "✅ VIP disabled for <b>" + escapeHtml(targetUser.first_name || targetUser.username || targetUserId) + "</b> (<code>" + targetUserId + "</code>).");
+      await sendReply(env, targetUserId, "📢 Your PixelPop VIP status has been turned off by an admin. You can still use the free download flow.");
+      return;
+    }
+
     // B. Admin Commands
     if (text.startsWith("/add ")) {
       const customTitle = text.replace("/add ", "").trim();
@@ -582,7 +635,7 @@ async function handleMessage(msg, env) {
   // ⛔ 2.1 Security Lockdown: Block unauthorized users attempting admin commands
   if (!isAdmin && (
     text === "/admin" || text === "/panel" || text === "/dashboard" ||
-    text.startsWith("/add") || text === "/done" || text.startsWith("/doneedit") || text.startsWith("/links") || text === "/cancel" ||
+    text.startsWith("/add") || text === "/done" || text.startsWith("/doneedit") || text.startsWith("/links") || text.startsWith("/vip_on") || text.startsWith("/vip_off") || text === "/cancel" ||
     text.startsWith("/title") || text === "/stats" ||
     text.startsWith("/ban") || text.startsWith("/unban") ||
     text.startsWith("/broadcast") || text.startsWith("/msg") ||
@@ -1313,12 +1366,23 @@ async function handleAdVerification(env, chatId, cb) {
   }
 }
 
+function isCompleteSeasonPack(batch) {
+  if (!batch) return false;
+  if (/\bcomplete\s+season\s+pack\b/i.test(String(batch.title || ""))) return true;
+  return Boolean(
+    String(batch.series_name || "").trim() &&
+    Number(batch.episode) === 0 &&
+    Number(batch.season || 0) > 0
+  );
+}
+
 // ================= SESSION & PREVIEW CARDS =================
 async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
   try {
     let targetMsgIds = [];
     let movieTitle = null;
     let posterUrl = null;
+    const paidPlansEnabled = await arePaidPlansEnabled(env);
 
     // Only database-issued batch tokens are allowed; legacy Base64 ID lists are disabled.
     if (/^b_[a-f0-9-]{8,40}$/i.test(payload)) {
@@ -1329,6 +1393,23 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
       if (!batch) {
         throw new Error("Batch not found");
       }
+
+      // Enforce VIP-only season packs on the server. Shared/stale Telegram URLs
+      // cannot bypass the UI and access every episode for free.
+      if (isCompleteSeasonPack(batch)) {
+        const currentUser = await env.DB.prepare("SELECT * FROM users WHERE user_id = ?").bind(chatId).first();
+        const activeVip = paidPlansEnabled && isUserVipActive(currentUser);
+        if (!activeVip) {
+          if (paidPlansEnabled) {
+            await sendReply(env, chatId, "🔒 <b>Complete Season Pack is VIP-only.</b>\nFree users can still download episodes one by one using individual episode links. To unlock the full-season pack, use /vip.");
+            await sendVipInfoCard(env, chatId);
+          } else {
+            await sendReply(env, chatId, "🔒 <b>Complete Season Pack is currently unavailable.</b>\nPaid Plans are OFF. Please use the individual episode links.");
+          }
+          return;
+        }
+      }
+
       targetMsgIds = JSON.parse(batch.msg_ids);
       movieTitle = batch.title;
       posterUrl = batch.poster_url || null;
@@ -1354,7 +1435,6 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
 
     // Check if user has active VIP (no cooldown, no daily limits, no ads)
     const user = await env.DB.prepare(`SELECT * FROM users WHERE user_id = ?`).bind(chatId).first();
-    const paidPlansEnabled = await arePaidPlansEnabled(env);
     if (paidPlansEnabled && isUserVipActive(user)) {
       await sendReply(
         env,
@@ -2126,6 +2206,9 @@ async function setAdminCommandMenu(env, chatId) {
     { command: "done", description: "Generate download links" },
     { command: "cancel", description: "Clear my upload queue" },
     { command: "stats", description: "View bot statistics" },
+    { command: "vip_on", description: "Activate VIP for a user ID" },
+    { command: "vip_off", description: "Deactivate VIP for a user ID" },
+    { command: "links", description: "Manage download links" },
     { command: "ban", description: "Ban a user by ID" },
     { command: "unban", description: "Unban a user by ID" },
     { command: "broadcast", description: "Broadcast to all users" },
@@ -2181,6 +2264,9 @@ async function sendAdminDashboard(env, chatId, editCb = null) {
         { text: "🚫 Ban Manager", callback_data: "adm_ban_menu" },
       ],
       [
+        { text: "👑 VIP Manager", callback_data: "adm_vip_mgr" },
+      ],
+      [
         { text: "⚙️ System Configuration", callback_data: "adm_config" },
         { text: "🔄 Refresh", callback_data: "adm_refresh" },
       ],
@@ -2224,6 +2310,29 @@ async function handleAdminPanelCallback(cb, env) {
 
   if (data === "adm_panel" || data === "adm_refresh") {
     await sendAdminDashboard(env, chatId, cb);
+    return;
+  }
+
+  if (data === "adm_vip_mgr") {
+    await showAdminVipManager(env, chatId, cb);
+    return;
+  }
+
+  if (data.startsWith("adm_vipoff_")) {
+    const targetUserId = data.slice("adm_vipoff_".length);
+    if (!/^\d{5,20}$/.test(targetUserId)) {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "Invalid user ID.", show_alert: true });
+      return;
+    }
+    const targetUser = await env.DB.prepare("SELECT user_id FROM users WHERE user_id = ?").bind(targetUserId).first();
+    if (!targetUser) {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "User not found.", show_alert: true });
+      return;
+    }
+    await env.DB.prepare("UPDATE users SET is_vip = 0, vip_until = 0 WHERE user_id = ?").bind(targetUserId).run();
+    await sendReply(env, chatId, "✅ VIP disabled for user " + targetUserId + ".");
+    await sendReply(env, targetUserId, "📢 Your PixelPop VIP status has been turned off by an admin. You can still use the free download flow.");
+    await showAdminVipManager(env, chatId, cb);
     return;
   }
 
@@ -2549,6 +2658,42 @@ async function handleAdminPanelCallback(cb, env) {
     await editTelegramMessage(env, cb, text, kb);
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
     return;
+  }
+}
+
+async function showAdminVipManager(env, chatId, editCb = null) {
+  const now = Date.now();
+  let active = [];
+  let total = 0;
+  try {
+    const count = await env.DB.prepare("SELECT COUNT(*) AS c FROM users WHERE is_vip = 1 AND vip_until > ? AND user_id NOT LIKE 'admin_%'").bind(now).first();
+    total = Number(count?.c || 0);
+    const result = await env.DB.prepare("SELECT user_id, username, first_name, vip_until FROM users WHERE is_vip = 1 AND vip_until > ? AND user_id NOT LIKE 'admin_%' ORDER BY vip_until ASC LIMIT 10").bind(now).all();
+    active = result?.results || [];
+  } catch (err) {
+    console.error("VIP manager query error:", err);
+    await sendReply(env, chatId, "❌ VIP Manager database query failed. Check Worker logs.");
+    return;
+  }
+
+  let body = "👑 <b>VIP User Manager</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ Active VIPs: <b>" + total + "</b>\n\n<b>Turn VIP ON:</b>\n<code>/vip_on USER_ID</code> — 30 days by default\n<code>/vip_on USER_ID 7</code> — 7 days\n<code>/vip_on USER_ID lifetime</code> — lifetime-style\n\n<b>Turn VIP OFF:</b>\n<code>/vip_off USER_ID</code>\n\n";
+  const buttons = [];
+  for (const u of active) {
+    const name = escapeHtml(u.first_name || u.username || u.user_id);
+    const daysLeft = Math.max(1, Math.ceil((Number(u.vip_until) - now) / (24 * 60 * 60 * 1000)));
+    body += "👤 <b>" + name + "</b> · <code>" + u.user_id + "</code> · " + daysLeft + " day(s) left\n";
+    buttons.push([{ text: "🔻 Turn OFF VIP · " + String(u.first_name || u.username || u.user_id).slice(0, 30), callback_data: "adm_vipoff_" + u.user_id }]);
+  }
+  if (!active.length) body += "No active VIP users right now.\n";
+  buttons.push([{ text: "🔄 Refresh", callback_data: "adm_vip_mgr" }, { text: "🏠 Admin panel", callback_data: "adm_panel" }]);
+  if (editCb) {
+    await editTelegramMessage(env, editCb, body, { inline_keyboard: buttons });
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: editCb.id });
+  } else {
+    await callTelegram(env.BOT_TOKEN, "sendMessage", {
+      chat_id: chatId, parse_mode: "HTML", text: body,
+      reply_markup: { inline_keyboard: buttons }, disable_web_page_preview: true,
+    });
   }
 }
 
@@ -3343,9 +3488,16 @@ async function handleBrowseSeasonEpisodes(env, cb, token, seasonNum) {
   }
 
   if (packToken) {
-    epButtons.push([
-      { text: `👑 Complete Season ${seasonNum} (VIP Pack)`, url: `https://t.me/${botUsername}?start=${packToken}` },
-    ]);
+    const paidPlansEnabled = await arePaidPlansEnabled(env);
+    if (paidPlansEnabled) {
+      const user = await env.DB.prepare("SELECT * FROM users WHERE user_id = ?").bind(cb.from.id.toString()).first();
+      const activeVip = isUserVipActive(user);
+      epButtons.push([
+        activeVip
+          ? { text: `👑 Complete Season ${seasonNum} (VIP Pack)`, url: `https://t.me/${botUsername}?start=${packToken}` }
+          : { text: `🔒 Complete Season ${seasonNum} (VIP Only)`, callback_data: "vip_pay_bank" },
+      ]);
+    }
   }
 
   epButtons.push([
