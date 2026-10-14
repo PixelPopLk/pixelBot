@@ -1441,9 +1441,21 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
         chatId,
         `👑 <b>VIP Member Detected!</b>\nBypassing all ads. Delivering your files immediately without expiry limit...`
       );
-      const vipResults = await sendBatchFiles(env, chatId, targetMsgIds, true);
+      const vipResults = await sendBatchFiles(env, chatId, targetMsgIds, true, Number(user.vip_until || 0));
       if (vipResults.length === targetMsgIds.length && vipResults.every((r) => r?.ok)) {
         await env.DB.prepare("UPDATE users SET delivered = 1, verify_token = NULL WHERE user_id = ?").bind(chatId).run();
+      } else {
+        const failedCount = vipResults.filter((r) => !r?.ok).length;
+        console.error("VIP batch delivery incomplete", {
+          userId: chatId,
+          expected: targetMsgIds.length,
+          sent: vipResults.filter((r) => r?.ok).length,
+          failed: vipResults.filter((r) => !r?.ok).map((r) => ({
+            error_code: r?.error_code || null,
+            description: r?.description || "Unknown Telegram copyMessage failure",
+          })),
+        });
+        await sendReply(env, chatId, "⚠️ VIP batch එකේ files කිහිපයක් යැවීමට නොහැකි වුණා (" + failedCount + " failed). Original download link එක නැවත විවෘත කර retry කරන්න. ගැටලුව දිගටම තිබුණොත් admin ට දන්වන්න.");
       }
       return;
     }
@@ -1510,31 +1522,59 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
 }
 
 // ================= FILE DELIVERY & DELETION QUEUE =================
-async function sendBatchFiles(env, chatId, msgIds, isVip = false) {
+async function sendBatchFiles(env, chatId, msgIds, isVip = false, vipExpiresAt = 0) {
   const results = [];
   if (!msgIds || msgIds.length === 0) return results;
 
   const sentMessageIds = [];
-  // Preserve the exact stored episode order. Parallel copyMessage calls can complete
-  // in a different order, causing episodes to appear shuffled in the user's chat.
-  // Await each Telegram copy before requesting the next one.
+  // Preserve stored order and retry Telegram rate-limit/transient failures so VIPs
+  // have a better chance of receiving the complete batch.
   for (const msgId of msgIds) {
-    const res = await callTelegram(env.BOT_TOKEN, "copyMessage", {
-      chat_id: chatId,
-      from_chat_id: env.STORAGE_CHANNEL_ID,
-      message_id: msgId,
-      protect_content: false, // Users need to be able to save files to their device.
-    });
+    let res = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      res = await callTelegram(env.BOT_TOKEN, "copyMessage", {
+        chat_id: chatId,
+        from_chat_id: env.STORAGE_CHANNEL_ID,
+        message_id: msgId,
+        protect_content: false,
+      });
+      if (res?.ok) break;
+      const retryAfter = Number(res?.parameters?.retry_after || 0);
+      const transient = res?.error_code === 429 || (Number(res?.error_code) >= 500 && Number(res?.error_code) < 600);
+      if (!transient || attempt === 2) break;
+      const delayMs = retryAfter > 0 ? Math.min(retryAfter, 20) * 1000 : 1000 * (attempt + 1);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
     if (res?.ok) sentMessageIds.push(res.result.message_id);
     results.push(res);
   }
 
   if (isVip) {
-    // VIP files are permanent
+    const now = Date.now();
+    // Telegram Bot API only permits deleting messages for a limited period (under 48h).
+    // Schedule before that limit when VIP membership expires later, so we don't promise
+    // deletion at a time when Telegram would reject deleteMessage.
+    const requestedExpiry = Number(vipExpiresAt || 0);
+    const deleteAt = Math.min(
+      requestedExpiry > now ? requestedExpiry : now + 12 * 60 * 60 * 1000,
+      now + 47 * 60 * 60 * 1000
+    );
+    for (const sentId of sentMessageIds) {
+      await env.DB.prepare(
+        "INSERT INTO deletions (chat_id, message_id, delete_at, reminded) VALUES (?, ?, ?, 0)"
+      ).bind(chatId, sentId, deleteAt).run();
+    }
+
+    const allSent = results.length === msgIds.length && results.every((r) => r?.ok);
+    const expiryLabel = deleteAt <= now + 47 * 60 * 60 * 1000 && requestedExpiry > deleteAt
+      ? "within 47 hours (Telegram's message-deletion limit)"
+      : "when your VIP membership expires";
     await sendReply(
       env,
       chatId,
-      `👑 <b>VIP Download Complete!</b>\n━━━━━━━━━━━━━━━━━━━━\nAs an active VIP member, these files will <b>NEVER be deleted</b> from your chat. Enjoy watching!`
+      allSent
+        ? "👑 <b>VIP Download Complete!</b>\n━━━━━━━━━━━━━━━━━━━━\nAll " + results.length + " files were sent in order. These files will be automatically deleted " + expiryLabel + ". Please save them to your device before then."
+        : "⚠️ <b>VIP Download Partially Complete</b>\n━━━━━━━━━━━━━━━━━━━━\nSent " + results.filter((r) => r?.ok).length + " of " + msgIds.length + " files. Failed files were retried where possible; please retry the original link for missing files."
     );
     return results;
   }
