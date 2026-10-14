@@ -2259,6 +2259,14 @@ async function handleAdminPanelCallback(cb, env) {
     return;
   }
 
+  if (data.startsWith("adm_ldc_")) {
+    const token = data.slice("adm_ldc_".length);
+    const result = await env.DB.prepare("DELETE FROM batches WHERE token = ?").bind(token).run();
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: Number(result?.meta?.changes || 0) ? "Download link deleted." : "Link already removed.", show_alert: true });
+    await showManagedLinks(env, chatId, "", 0, cb);
+    return;
+  }
+
   if (data.startsWith("adm_ld_")) {
     const token = data.slice("adm_ld_".length);
     const batch = await env.DB.prepare("SELECT token, title FROM batches WHERE token = ?").bind(token).first();
@@ -2272,14 +2280,6 @@ async function handleAdminPanelCallback(cb, env) {
     ] };
     await editTelegramMessage(env, cb, `⚠️ <b>Delete this download link?</b>\n\nTitle: <b>${escapeHtml(batch.title || "Untitled")}</b>\nToken: <code>${escapeHtml(token)}</code>\n\nමෙම link එක ඉදිරියේදී වැඩ නොකරනු ඇත. Stored files channel එකෙන් මැකෙන්නේ නැහැ.`, kb);
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
-    return;
-  }
-
-  if (data.startsWith("adm_ldc_")) {
-    const token = data.slice("adm_ldc_".length);
-    const result = await env.DB.prepare("DELETE FROM batches WHERE token = ?").bind(token).run();
-    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: Number(result?.meta?.changes || 0) ? "Download link deleted." : "Link already removed.", show_alert: true });
-    await showManagedLinks(env, chatId, "", 0, cb);
     return;
   }
 
@@ -2552,12 +2552,12 @@ async function showManagedLinks(env, chatId, query = "", offset = 0, editCb = nu
   let rows = [];
   let total = 0;
   try {
-    const pattern = "%" + searchText.replace(/[\\%_]/g, "\\async function handleAdminStats(env, chatId) {") + "%";
-    const count = await env.DB.prepare("SELECT COUNT(*) AS c FROM batches WHERE (? = '' OR title LIKE ? ESCAPE '\\\\')")
+    const pattern = "%" + searchText + "%";
+    const count = await env.DB.prepare("SELECT COUNT(*) AS c FROM batches WHERE (? = '' OR title LIKE ?)")
       .bind(searchText, pattern).first();
     total = Number(count?.c || 0);
     const result = await env.DB.prepare(`SELECT token, title, msg_ids, created_at FROM batches
-      WHERE (? = '' OR title LIKE ? ESCAPE '\\\\')
+      WHERE (? = '' OR title LIKE ?)
       ORDER BY created_at DESC LIMIT 8 OFFSET ?`).bind(searchText, pattern, safeOffset).all();
     rows = result?.results || [];
   } catch (err) {
