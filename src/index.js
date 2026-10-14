@@ -404,6 +404,74 @@ async function handleMessage(msg, env) {
       return;
     }
 
+    // Rename flow: consume the next admin text as the new title, unless cancelled.
+    const editSettingKey = "admin_edit_batch_" + chatId;
+    const pendingEdit = await env.DB.prepare("SELECT setting_value FROM bot_settings WHERE setting_key = ?").bind(editSettingKey).first();
+    if (pendingEdit?.setting_value && text !== "/cancel" && !text.startsWith("/")) {
+      const result = await env.DB.prepare("UPDATE batches SET title = ? WHERE token = ?")
+        .bind(text.slice(0, 180), pendingEdit.setting_value).run();
+      await env.DB.prepare("DELETE FROM bot_settings WHERE setting_key = ?").bind(editSettingKey).run();
+      if (Number(result?.meta?.changes || 0) === 1) {
+        await sendReply(env, chatId, "✅ Download link title updated. The same token/link still works.");
+      } else {
+        await sendReply(env, chatId, "❌ Link not found. Nothing was changed.");
+      }
+      return;
+    }
+
+    // Admin VIP controls: /vip_on <user_id> [days|lifetime], /vip_off <user_id>
+    if (text === "/vip_on" || text.startsWith("/vip_on ")) {
+      const parts = text.trim().split(/\s+/);
+      const targetUserId = parts[1] || "";
+      const duration = (parts[2] || "30").toLowerCase();
+      if (!/^\d{5,20}$/.test(targetUserId)) {
+        await sendReply(env, chatId, "Usage: <code>/vip_on USER_ID [days|lifetime]</code>\nDefault: 30 days. Example: <code>/vip_on 123456789 30</code>");
+        return;
+      }
+      const targetUser = await env.DB.prepare("SELECT user_id, first_name, username FROM users WHERE user_id = ?").bind(targetUserId).first();
+      if (!targetUser) {
+        await sendReply(env, chatId, "❌ User not found. Ask the user to open the bot and send /start first.");
+        return;
+      }
+      let durationMs;
+      let planLabel;
+      if (duration === "lifetime") {
+        durationMs = 100 * 365 * 24 * 60 * 60 * 1000;
+        planLabel = "Lifetime-style (100-year expiry)";
+      } else {
+        const days = Number(duration);
+        if (!/^\d{1,4}$/.test(duration) || !Number.isInteger(days) || days < 1 || days > 3650) {
+          await sendReply(env, chatId, "❌ VIP duration must be 1–3650 days or <code>lifetime</code>.");
+          return;
+        }
+        durationMs = days * 24 * 60 * 60 * 1000;
+        planLabel = String(days) + " day(s)";
+      }
+      const expiresAt = Date.now() + durationMs;
+      await env.DB.prepare("UPDATE users SET is_vip = 1, vip_until = ? WHERE user_id = ?").bind(expiresAt, targetUserId).run();
+      await sendReply(env, chatId, "✅ VIP activated for <b>" + escapeHtml(targetUser.first_name || targetUser.username || targetUserId) + "</b> (<code>" + targetUserId + "</code>).\nDuration: <b>" + planLabel + "</b>.\nNote: VIP download benefits require Paid Plans to be ON.");
+      await sendReply(env, targetUserId, "👑 <b>Your PixelPop VIP status was activated by an admin.</b>\nDuration: <b>" + planLabel + "</b>. Enjoy VIP benefits while your membership is active.");
+      return;
+    }
+
+    if (text === "/vip_off" || text.startsWith("/vip_off ")) {
+      const parts = text.trim().split(/\s+/);
+      const targetUserId = parts[1] || "";
+      if (!/^\d{5,20}$/.test(targetUserId)) {
+        await sendReply(env, chatId, "Usage: <code>/vip_off USER_ID</code>");
+        return;
+      }
+      const targetUser = await env.DB.prepare("SELECT user_id, first_name, username FROM users WHERE user_id = ?").bind(targetUserId).first();
+      if (!targetUser) {
+        await sendReply(env, chatId, "❌ User not found in the bot database.");
+        return;
+      }
+      await env.DB.prepare("UPDATE users SET is_vip = 0, vip_until = 0 WHERE user_id = ?").bind(targetUserId).run();
+      await sendReply(env, chatId, "✅ VIP disabled for <b>" + escapeHtml(targetUser.first_name || targetUser.username || targetUserId) + "</b> (<code>" + targetUserId + "</code>).");
+      await sendReply(env, targetUserId, "📢 Your PixelPop VIP status has been turned off by an admin. You can still use the free download flow.");
+      return;
+    }
+
     // B. Admin Commands
     if (text.startsWith("/add ")) {
       const customTitle = text.replace("/add ", "").trim();
@@ -421,6 +489,26 @@ async function handleMessage(msg, env) {
         chatId,
         `🎬 <b>Ready to Add:</b> <i>${escapeHtml(customTitle)}</i>\n━━━━━━━━━━━━━━━━━━━━\nForward all episodes or movie files now. When finished, send /done or click Generate Links.`
       );
+      return;
+    }
+
+    if (text === "/cancel" || text.startsWith("/cancel ")) {
+      const editKey = "admin_edit_batch_" + chatId;
+      const replaceKey = "admin_replace_batch_" + chatId;
+      await env.DB.prepare("DELETE FROM bot_settings WHERE setting_key IN (?, ?)").bind(editKey, replaceKey).run();
+      await env.DB.prepare("DELETE FROM admin_batch WHERE admin_id = ?").bind(chatId).run();
+      await sendReply(env, chatId, "🗑️ Pending link-management action and upload queue cancelled.");
+      return;
+    }
+
+    if (text.startsWith("/doneedit")) {
+      await finishBatchReplacement(env, chatId);
+      return;
+    }
+
+    if (text === "/links" || text.startsWith("/links ")) {
+      const query = text.replace(/^\/links\s*/i, "").trim();
+      await showManagedLinks(env, chatId, query, 0);
       return;
     }
 
@@ -547,7 +635,7 @@ async function handleMessage(msg, env) {
   // ⛔ 2.1 Security Lockdown: Block unauthorized users attempting admin commands
   if (!isAdmin && (
     text === "/admin" || text === "/panel" || text === "/dashboard" ||
-    text.startsWith("/add") || text === "/done" || text === "/cancel" ||
+    text.startsWith("/add") || text === "/done" || text.startsWith("/doneedit") || text.startsWith("/links") || text.startsWith("/vip_on") || text.startsWith("/vip_off") || text === "/cancel" ||
     text.startsWith("/title") || text === "/stats" ||
     text.startsWith("/ban") || text.startsWith("/unban") ||
     text.startsWith("/broadcast") || text.startsWith("/msg") ||
@@ -1256,7 +1344,16 @@ async function handleAdVerification(env, chatId, cb) {
     } else {
       await env.DB.prepare("UPDATE users SET ad_verified = 0 WHERE user_id = ? AND ad_started_at = ?")
         .bind(chatId, adStartedAt).run();
-      console.error("Ad-verified file delivery incomplete", { userId: chatId, expected: idsToSend.length, sent: results.filter((r) => r?.ok).length });
+      console.error("Ad-verified file delivery incomplete", {
+        userId: chatId,
+        expected: idsToSend.length,
+        sent: results.filter((r) => r?.ok).length,
+        failed: results.filter((r) => !r?.ok).map((r, index) => ({
+          index,
+          error_code: r?.error_code || null,
+          description: r?.description || "Unknown Telegram copyMessage failure",
+        })),
+      });
       await sendReply(env, chatId, "⚠️ සමහර files යැවීමට නොහැකි වුණා. Retry බොත්තම ඔබන්න. ගැටලුව දිගටම තිබුණොත් admin ට දන්වන්න.");
     }
   } catch (err) {
@@ -1269,12 +1366,23 @@ async function handleAdVerification(env, chatId, cb) {
   }
 }
 
+function isCompleteSeasonPack(batch) {
+  if (!batch) return false;
+  if (/\bcomplete\s+season\s+pack\b/i.test(String(batch.title || ""))) return true;
+  return Boolean(
+    String(batch.series_name || "").trim() &&
+    Number(batch.episode) === 0 &&
+    Number(batch.season || 0) > 0
+  );
+}
+
 // ================= SESSION & PREVIEW CARDS =================
 async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
   try {
     let targetMsgIds = [];
     let movieTitle = null;
     let posterUrl = null;
+    const paidPlansEnabled = await arePaidPlansEnabled(env);
 
     // Only database-issued batch tokens are allowed; legacy Base64 ID lists are disabled.
     if (/^b_[a-f0-9-]{8,40}$/i.test(payload)) {
@@ -1285,6 +1393,23 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
       if (!batch) {
         throw new Error("Batch not found");
       }
+
+      // Enforce VIP-only season packs on the server. Shared/stale Telegram URLs
+      // cannot bypass the UI and access every episode for free.
+      if (isCompleteSeasonPack(batch)) {
+        const currentUser = await env.DB.prepare("SELECT * FROM users WHERE user_id = ?").bind(chatId).first();
+        const activeVip = paidPlansEnabled && isUserVipActive(currentUser);
+        if (!activeVip) {
+          if (paidPlansEnabled) {
+            await sendReply(env, chatId, "🔒 <b>Complete Season Pack is VIP-only.</b>\nFree users can still download episodes one by one using individual episode links. To unlock the full-season pack, use /vip.");
+            await sendVipInfoCard(env, chatId);
+          } else {
+            await sendReply(env, chatId, "🔒 <b>Complete Season Pack is currently unavailable.</b>\nPaid Plans are OFF. Please use the individual episode links.");
+          }
+          return;
+        }
+      }
+
       targetMsgIds = JSON.parse(batch.msg_ids);
       movieTitle = batch.title;
       posterUrl = batch.poster_url || null;
@@ -1310,7 +1435,6 @@ async function initiateFileSession(env, chatId, payload, paidFastPass = false) {
 
     // Check if user has active VIP (no cooldown, no daily limits, no ads)
     const user = await env.DB.prepare(`SELECT * FROM users WHERE user_id = ?`).bind(chatId).first();
-    const paidPlansEnabled = await arePaidPlansEnabled(env);
     if (paidPlansEnabled && isUserVipActive(user)) {
       await sendReply(
         env,
@@ -2082,6 +2206,9 @@ async function setAdminCommandMenu(env, chatId) {
     { command: "done", description: "Generate download links" },
     { command: "cancel", description: "Clear my upload queue" },
     { command: "stats", description: "View bot statistics" },
+    { command: "vip_on", description: "Activate VIP for a user ID" },
+    { command: "vip_off", description: "Deactivate VIP for a user ID" },
+    { command: "links", description: "Manage download links" },
     { command: "ban", description: "Ban a user by ID" },
     { command: "unban", description: "Unban a user by ID" },
     { command: "broadcast", description: "Broadcast to all users" },
@@ -2133,7 +2260,11 @@ async function sendAdminDashboard(env, chatId, editCb = null) {
       ],
       [
         { text: `📦 Queue & Add (${queueCount})`, callback_data: "adm_queue" },
+        { text: "🔗 Link Manager", callback_data: "adm_links" },
         { text: "🚫 Ban Manager", callback_data: "adm_ban_menu" },
+      ],
+      [
+        { text: "👑 VIP Manager", callback_data: "adm_vip_mgr" },
       ],
       [
         { text: "⚙️ System Configuration", callback_data: "adm_config" },
@@ -2179,6 +2310,94 @@ async function handleAdminPanelCallback(cb, env) {
 
   if (data === "adm_panel" || data === "adm_refresh") {
     await sendAdminDashboard(env, chatId, cb);
+    return;
+  }
+
+  if (data === "adm_vip_mgr") {
+    await showAdminVipManager(env, chatId, cb);
+    return;
+  }
+
+  if (data.startsWith("adm_vipoff_")) {
+    const targetUserId = data.slice("adm_vipoff_".length);
+    if (!/^\d{5,20}$/.test(targetUserId)) {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "Invalid user ID.", show_alert: true });
+      return;
+    }
+    const targetUser = await env.DB.prepare("SELECT user_id FROM users WHERE user_id = ?").bind(targetUserId).first();
+    if (!targetUser) {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "User not found.", show_alert: true });
+      return;
+    }
+    await env.DB.prepare("UPDATE users SET is_vip = 0, vip_until = 0 WHERE user_id = ?").bind(targetUserId).run();
+    await sendReply(env, chatId, "✅ VIP disabled for user " + targetUserId + ".");
+    await sendReply(env, targetUserId, "📢 Your PixelPop VIP status has been turned off by an admin. You can still use the free download flow.");
+    await showAdminVipManager(env, chatId, cb);
+    return;
+  }
+
+  if (data === "adm_links" || data.startsWith("adm_lp_")) {
+    const offset = data.startsWith("adm_lp_") ? Math.max(0, Number(data.slice("adm_lp_".length)) || 0) : 0;
+    let query = "";
+    try {
+      const saved = await env.DB.prepare("SELECT setting_value FROM bot_settings WHERE setting_key = ?")
+        .bind("admin_links_search_" + chatId).first();
+      query = saved?.setting_value || "";
+    } catch {}
+    await showManagedLinks(env, chatId, query, offset, cb);
+    return;
+  }
+
+  if (data.startsWith("adm_le_")) {
+    const token = data.slice("adm_le_".length);
+    const batch = await env.DB.prepare("SELECT token, title FROM batches WHERE token = ?").bind(token).first();
+    if (!batch) {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "Link not found.", show_alert: true });
+      return;
+    }
+    await env.DB.prepare("INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?) ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value")
+      .bind("admin_edit_batch_" + chatId, token).run();
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "Send the new title in chat." });
+    await sendReply(env, chatId, `✏️ <b>Rename download link</b>\nCurrent title: <b>${escapeHtml(batch.title || "Untitled")}</b>\n\nදැන් අලුත් title එක message එකක් ලෙස යවන්න. Cancel කිරීමට <code>/cancel</code> යවන්න.`);
+    return;
+  }
+
+  if (data.startsWith("adm_lr_")) {
+    const token = data.slice("adm_lr_".length);
+    const batch = await env.DB.prepare("SELECT token, title FROM batches WHERE token = ?").bind(token).first();
+    if (!batch) {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "Link not found.", show_alert: true });
+      return;
+    }
+    await env.DB.prepare("DELETE FROM admin_batch WHERE admin_id = ?").bind(chatId).run();
+    await env.DB.prepare("INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?) ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value")
+      .bind("admin_replace_batch_" + chatId, token).run();
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "Forward replacement files, then /doneedit." });
+    await sendReply(env, chatId, `♻️ <b>Replace files for:</b> ${escapeHtml(batch.title || token)}\n\n1. Replacement file(s) forward කරන්න.\n2. අවසානයේ <code>/doneedit</code> යවන්න.\n3. Cancel කිරීමට <code>/cancel</code> යවන්න.\n\n⚠️ Save කරන තුරු පරණ link එක වෙනස් නොවේ.`);
+    return;
+  }
+
+  if (data.startsWith("adm_ldc_")) {
+    const token = data.slice("adm_ldc_".length);
+    const result = await env.DB.prepare("DELETE FROM batches WHERE token = ?").bind(token).run();
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: Number(result?.meta?.changes || 0) ? "Download link deleted." : "Link already removed.", show_alert: true });
+    await showManagedLinks(env, chatId, "", 0, cb);
+    return;
+  }
+
+  if (data.startsWith("adm_ld_")) {
+    const token = data.slice("adm_ld_".length);
+    const batch = await env.DB.prepare("SELECT token, title FROM batches WHERE token = ?").bind(token).first();
+    if (!batch) {
+      await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "Link not found.", show_alert: true });
+      return;
+    }
+    const kb = { inline_keyboard: [
+      [{ text: "🗑️ Yes, delete link", callback_data: "adm_ldc_" + token }],
+      [{ text: "↩️ Cancel", callback_data: "adm_links" }],
+    ] };
+    await editTelegramMessage(env, cb, `⚠️ <b>Delete this download link?</b>\n\nTitle: <b>${escapeHtml(batch.title || "Untitled")}</b>\nToken: <code>${escapeHtml(token)}</code>\n\nමෙම link එක ඉදිරියේදී වැඩ නොකරනු ඇත. Stored files channel එකෙන් මැකෙන්නේ නැහැ.`, kb);
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
     return;
   }
 
@@ -2440,6 +2659,126 @@ async function handleAdminPanelCallback(cb, env) {
     await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
     return;
   }
+}
+
+async function showAdminVipManager(env, chatId, editCb = null) {
+  const now = Date.now();
+  let active = [];
+  let total = 0;
+  try {
+    const count = await env.DB.prepare("SELECT COUNT(*) AS c FROM users WHERE is_vip = 1 AND vip_until > ? AND user_id NOT LIKE 'admin_%'").bind(now).first();
+    total = Number(count?.c || 0);
+    const result = await env.DB.prepare("SELECT user_id, username, first_name, vip_until FROM users WHERE is_vip = 1 AND vip_until > ? AND user_id NOT LIKE 'admin_%' ORDER BY vip_until ASC LIMIT 10").bind(now).all();
+    active = result?.results || [];
+  } catch (err) {
+    console.error("VIP manager query error:", err);
+    await sendReply(env, chatId, "❌ VIP Manager database query failed. Check Worker logs.");
+    return;
+  }
+
+  let body = "👑 <b>VIP User Manager</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ Active VIPs: <b>" + total + "</b>\n\n<b>Turn VIP ON:</b>\n<code>/vip_on USER_ID</code> — 30 days by default\n<code>/vip_on USER_ID 7</code> — 7 days\n<code>/vip_on USER_ID lifetime</code> — lifetime-style\n\n<b>Turn VIP OFF:</b>\n<code>/vip_off USER_ID</code>\n\n";
+  const buttons = [];
+  for (const u of active) {
+    const name = escapeHtml(u.first_name || u.username || u.user_id);
+    const daysLeft = Math.max(1, Math.ceil((Number(u.vip_until) - now) / (24 * 60 * 60 * 1000)));
+    body += "👤 <b>" + name + "</b> · <code>" + u.user_id + "</code> · " + daysLeft + " day(s) left\n";
+    buttons.push([{ text: "🔻 Turn OFF VIP · " + String(u.first_name || u.username || u.user_id).slice(0, 30), callback_data: "adm_vipoff_" + u.user_id }]);
+  }
+  if (!active.length) body += "No active VIP users right now.\n";
+  buttons.push([{ text: "🔄 Refresh", callback_data: "adm_vip_mgr" }, { text: "🏠 Admin panel", callback_data: "adm_panel" }]);
+  if (editCb) {
+    await editTelegramMessage(env, editCb, body, { inline_keyboard: buttons });
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: editCb.id });
+  } else {
+    await callTelegram(env.BOT_TOKEN, "sendMessage", {
+      chat_id: chatId, parse_mode: "HTML", text: body,
+      reply_markup: { inline_keyboard: buttons }, disable_web_page_preview: true,
+    });
+  }
+}
+
+async function showManagedLinks(env, chatId, query = "", offset = 0, editCb = null) {
+  const safeOffset = Math.max(0, Math.min(100000, Number(offset) || 0));
+  const searchText = String(query || "").trim().slice(0, 80);
+  await env.DB.prepare("INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?) ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value")
+    .bind("admin_links_search_" + chatId, searchText).run();
+
+  let rows = [];
+  let total = 0;
+  try {
+    const pattern = "%" + searchText + "%";
+    const count = await env.DB.prepare("SELECT COUNT(*) AS c FROM batches WHERE (? = '' OR title LIKE ?)")
+      .bind(searchText, pattern).first();
+    total = Number(count?.c || 0);
+    const result = await env.DB.prepare(`SELECT token, title, msg_ids, created_at FROM batches
+      WHERE (? = '' OR title LIKE ?)
+      ORDER BY created_at DESC LIMIT 8 OFFSET ?`).bind(searchText, pattern, safeOffset).all();
+    rows = result?.results || [];
+  } catch (err) {
+    console.error("Link manager query error:", err);
+    await sendReply(env, chatId, "❌ Link Manager database query failed. Check Worker logs.");
+    return;
+  }
+
+  const botUsername = env.BOT_USERNAME || "PixelPopStorebot";
+  const buttons = [];
+  let body = `🔗 <b>Telegram Download Link Manager</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 Matching links: <b>${total}</b>\n`;
+  if (searchText) body += `🔎 Search: <code>${escapeHtml(searchText)}</code>\n`;
+  body += "\n";
+  for (const row of rows) {
+    let fileCount = 0;
+    try { const ids = JSON.parse(row.msg_ids || "[]"); fileCount = Array.isArray(ids) ? ids.length : 0; } catch {}
+    const link = `https://t.me/${botUsername}?start=${row.token}`;
+    body += `🎬 <b>${escapeHtml(row.title || "Untitled")}</b>\n📁 Files: ${fileCount} · Token: <code>${escapeHtml(row.token)}</code>\n🔗 <a href="${link}">Open download link</a>\n\n`;
+    buttons.push([
+      { text: "✏️ Rename", callback_data: "adm_le_" + row.token },
+      { text: "♻️ Replace files", callback_data: "adm_lr_" + row.token },
+      { text: "🗑️ Delete", callback_data: "adm_ld_" + row.token },
+    ]);
+  }
+  if (!rows.length) body += "No links found. Try <code>/links</code> or <code>/links title</code>.\n";
+  const nav = [];
+  if (safeOffset > 0) nav.push({ text: "⬅️ Previous", callback_data: "adm_lp_" + Math.max(0, safeOffset - 8) });
+  if (safeOffset + rows.length < total) nav.push({ text: "Next ➡️", callback_data: "adm_lp_" + (safeOffset + 8) });
+  if (nav.length) buttons.push(nav);
+  buttons.push([{ text: "➕ Add new link (/add)", callback_data: "adm_queue" }]);
+  buttons.push([{ text: "🔄 Refresh", callback_data: "adm_links" }, { text: "🏠 Admin panel", callback_data: "adm_panel" }]);
+
+  if (editCb) {
+    await editTelegramMessage(env, editCb, body, { inline_keyboard: buttons });
+    await callTelegram(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: editCb.id });
+  } else {
+    await callTelegram(env.BOT_TOKEN, "sendMessage", {
+      chat_id: chatId, parse_mode: "HTML", text: body,
+      reply_markup: { inline_keyboard: buttons }, disable_web_page_preview: true,
+    });
+  }
+}
+
+async function finishBatchReplacement(env, chatId) {
+  const settingKey = "admin_replace_batch_" + chatId;
+  const setting = await env.DB.prepare("SELECT setting_value FROM bot_settings WHERE setting_key = ?").bind(settingKey).first();
+  const token = setting?.setting_value;
+  if (!token) {
+    await sendReply(env, chatId, "⚠️ Replacement mode active නැහැ. Link Manager එකෙන් Replace files තෝරන්න.");
+    return;
+  }
+  const queued = await env.DB.prepare("SELECT message_id FROM admin_batch WHERE admin_id = ? ORDER BY id ASC").bind(chatId).all();
+  const ids = (queued?.results || []).map((r) => Number(r.message_id)).filter((id) => Number.isInteger(id) && id > 0);
+  if (!ids.length) {
+    await sendReply(env, chatId, "❌ Replacement files queue එක හිස්. Files forward කරලා නැවත /doneedit යවන්න.");
+    return;
+  }
+  const update = await env.DB.prepare("UPDATE batches SET msg_ids = ? WHERE token = ?").bind(JSON.stringify(ids), token).run();
+  if (Number(update?.meta?.changes || 0) !== 1) {
+    await sendReply(env, chatId, "❌ Link එක හමු වුණේ නැහැ. පරණ link එක වෙනස් කරලා නැහැ.");
+    return;
+  }
+  await env.DB.prepare("DELETE FROM admin_batch WHERE admin_id = ?").bind(chatId).run();
+  await env.DB.prepare("DELETE FROM bot_settings WHERE setting_key = ?").bind(settingKey).run();
+  const row = await env.DB.prepare("SELECT title FROM batches WHERE token = ?").bind(token).first();
+  const link = `https://t.me/${env.BOT_USERNAME || "PixelPopStorebot"}?start=${token}`;
+  await sendReply(env, chatId, `✅ <b>Files updated successfully!</b>\n🎬 ${escapeHtml(row?.title || token)}\n📁 New files: <b>${ids.length}</b>\n🔗 <a href="${link}">Existing download link</a> දැන් අලුත් files ලබා දෙයි.`);
 }
 
 async function handleAdminStats(env, chatId) {
@@ -3104,7 +3443,7 @@ async function handleBrowseSeasonEpisodes(env, cb, token, seasonNum) {
     const res = await env.DB.prepare(`
       SELECT * FROM batches 
       WHERE series_name = ? OR title LIKE ?
-      ORDER BY episode ASC, created_at ASC
+      ORDER BY created_at DESC, episode ASC
     `).bind(seriesName, `%${seriesName}%`).all();
     all = res?.results || [];
   } catch {
@@ -3149,9 +3488,16 @@ async function handleBrowseSeasonEpisodes(env, cb, token, seasonNum) {
   }
 
   if (packToken) {
-    epButtons.push([
-      { text: `👑 Complete Season ${seasonNum} (VIP Pack)`, url: `https://t.me/${botUsername}?start=${packToken}` },
-    ]);
+    const paidPlansEnabled = await arePaidPlansEnabled(env);
+    if (paidPlansEnabled) {
+      const user = await env.DB.prepare("SELECT * FROM users WHERE user_id = ?").bind(cb.from.id.toString()).first();
+      const activeVip = isUserVipActive(user);
+      epButtons.push([
+        activeVip
+          ? { text: `👑 Complete Season ${seasonNum} (VIP Pack)`, url: `https://t.me/${botUsername}?start=${packToken}` }
+          : { text: `🔒 Complete Season ${seasonNum} (VIP Only)`, callback_data: "vip_pay_bank" },
+      ]);
+    }
   }
 
   epButtons.push([
@@ -3185,15 +3531,16 @@ async function handleBrowseEpisodeQuality(env, cb, epToken, parentToken, seasonN
   try {
     const res = await env.DB.prepare(`
       SELECT * FROM batches 
-      WHERE (series_name = ? OR title LIKE ?) AND (season = ? OR title LIKE ?)
+      WHERE series_name = ? OR title LIKE ?
       ORDER BY created_at DESC
-      LIMIT 20
-    `).bind(seriesName, `%${seriesName}%`, seasonNum, `%Season ${seasonNum}%`).all();
+      LIMIT 100
+    `).bind(seriesName, `%${seriesName}%`).all();
 
     variants = (res?.results || []).filter((b) => {
       const bMeta = parseMediaTitle(b.title);
+      const bSeason = b.season || bMeta.season || 1;
       const bEp = b.episode || bMeta.episode;
-      return bEp === epNum;
+      return Number(bSeason) === Number(seasonNum) && Number(bEp) === Number(epNum);
     });
   } catch {
     variants = [epBatch];
